@@ -21,12 +21,14 @@ def _stop_key(run_id: str) -> str:
     return f"agent:stop:{run_id}"
 
 
-async def request_stop(run_id: str, ttl_seconds: int = 600) -> None:
+async def request_stop(run_id: str, ttl_seconds: int = 600) -> bool:
     try:
         client = await _get_client()
         await client.set(_stop_key(run_id), "1", ex=ttl_seconds)
+        return True
     except Exception as e:
         logger.error(f"Failed to set stop flag for {run_id}: {e}")
+        return False
 
 
 async def clear_stop(run_id: str) -> None:

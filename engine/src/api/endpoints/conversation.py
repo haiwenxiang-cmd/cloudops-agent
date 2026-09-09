@@ -9,6 +9,7 @@ from tortoise.expressions import Q
 from ..config import rate_limit_dependency
 from ..models.conversation import Conversation, ConversationUpdate, Message
 from ..services.auth import fastapi_users
+from ..services.conversation_persistence import ConversationPersistenceService
 
 logger = logging.getLogger(__name__)
 
@@ -211,12 +212,15 @@ async def check_conversation(
 
         check_conversation_authorization(conversation, user)
 
+        messages = await ConversationPersistenceService().project_authoritative_mutation_statuses(
+            conversation_id, conversation.messages_json or []
+        )
         return {
             "status": "success",
             "exists": True,
             "id": str(conversation.id),
             "created_at": conversation.created_at.isoformat(),
-            "messages": conversation.messages_json,
+            "messages": messages,
         }
 
     except HTTPException:

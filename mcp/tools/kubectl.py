@@ -1,8 +1,9 @@
 """Kubernetes tools implementation for MCP server."""
 
 import asyncio
+import json
 import shlex
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from pydantic import Field
 
@@ -12,6 +13,19 @@ from utils.models import ToolOutput
 
 _VALID_OUTPUT_FORMATS: frozenset[str] = frozenset({"wide", "yaml", "json", "name"})
 _VALID_PATCH_TYPES: frozenset[str] = frozenset({"strategic", "merge", "json"})
+
+
+def _redact_secret_payload(payload: Any) -> Any:
+    """Remove Kubernetes Secret values while retaining metadata for verification."""
+    if not isinstance(payload, dict):
+        return payload
+    sanitized = dict(payload)
+    if str(sanitized.get("kind") or "").lower() == "secret":
+        sanitized.pop("data", None)
+        sanitized.pop("stringData", None)
+    if isinstance(sanitized.get("items"), list):
+        sanitized["items"] = [_redact_secret_payload(item) for item in sanitized["items"]]
+    return sanitized
 
 
 def _normalize_enum_arg(
@@ -142,7 +156,33 @@ async def k8s_get(
         args.append("-A")
     if isinstance(label_selector, str) and label_selector:
         args.extend(["-l", label_selector])
-    return await run_command("kubectl", args)
+    if resource_type.strip().lower() in {"secret", "secrets"} and output_normalized == "yaml":
+        return {
+            "output": (
+                "Structured YAML output for Secrets is blocked because it may expose "
+                "credential values. Use JSON for redacted metadata or table/name output."
+            ),
+            "error": True,
+            "error_type": "authorization",
+            "retryable": False,
+        }
+    result = await run_command("kubectl", args)
+    if (
+        not result.get("error")
+        and resource_type.strip().lower() in {"secret", "secrets"}
+        and output_normalized == "json"
+    ):
+        try:
+            payload = json.loads(result["output"])
+            result["output"] = json.dumps(_redact_secret_payload(payload), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return {
+                "output": "Secret output could not be safely redacted.",
+                "error": True,
+                "error_type": "redaction_failed",
+                "retryable": False,
+            }
+    return result
 
 
 @mcp.tool(

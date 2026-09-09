@@ -1,20 +1,169 @@
 import json
 import logging
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from tortoise.exceptions import DoesNotExist
 
 from ..models.conversation import Conversation, Message, TokenUsageMetrics
+from ..models.mutation import ExecutionStatus, MutationOperation, VerificationStatus
 
 logger = logging.getLogger(__name__)
+
+ACTIVE_TOOL_STATUSES = {"pending", "executing", "approved", "awaiting_approval"}
+SAFE_VERIFICATION_REASONS = {
+    "helm_manifest_invalid",
+    "helm_manifest_unavailable",
+    "helm_status_error",
+    "invalid_helm_status_json",
+    "operation_not_found",
+    "partial_commit_detected",
+    "verification_adapter_error",
+    "verification_adapter_not_supported",
+    "verification_already_in_progress",
+    "verification_budget_exhausted",
+    "verification_cancelled",
+    "verification_lease_expired",
+    "verification_timeout",
+}
+
+
+def project_mutation_operations(
+    messages: List[Dict[str, Any]], operations: List[MutationOperation]
+) -> List[Dict[str, Any]]:
+    """Overlay durable mutation truth on the denormalized chat projection."""
+    projected = deepcopy(messages)
+    by_call_id = {str(op.call_id): op for op in operations if op.call_id}
+
+    for message in projected:
+        if message.get("type") != "assistant":
+            continue
+        segments = message.get("segments")
+        if not isinstance(segments, list):
+            continue
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get("kind") != "tool":
+                continue
+            execution = segment.get("toolExecution")
+            if not isinstance(execution, dict):
+                continue
+            call_id = str(execution.get("call_id") or segment.get("id") or "")
+            operation = by_call_id.get(call_id)
+            if operation is None:
+                continue
+
+            verification = operation.verification_status
+            execution_status = operation.execution_status
+            verification_result = getattr(operation, "verification_result", {})
+            if not isinstance(verification_result, dict):
+                verification_result = {}
+            verification_reason = verification_result.get("reason")
+            execution["operation_id"] = str(operation.id)
+            execution["execution_status"] = execution_status.value
+            execution["verification_status"] = verification.value
+            # Expose only stable, non-sensitive recovery metadata. The complete
+            # verification evidence remains in the journal and is intentionally
+            # not copied into the chat projection.
+            if (
+                isinstance(verification_reason, str)
+                and verification_reason in SAFE_VERIFICATION_REASONS
+            ):
+                execution["verification_reason"] = verification_reason
+            else:
+                execution.pop("verification_reason", None)
+            execution["partial_commit_detected"] = bool(
+                verification_result.get("partial_commit_detected")
+                or verification_reason == "partial_commit_detected"
+            )
+            execution["requires_verification"] = verification in {
+                VerificationStatus.PENDING,
+                VerificationStatus.VERIFYING,
+                VerificationStatus.INCONCLUSIVE,
+            }
+
+            if verification == VerificationStatus.PASSED:
+                execution["status"] = "completed"
+                execution.pop("error", None)
+                execution["result"] = [
+                    {"type": "text", "text": "Mutation completed and verification passed."}
+                ]
+            elif verification == VerificationStatus.NEEDS_REVIEW:
+                execution["status"] = "error"
+                execution["error"] = (
+                    "Automatic verification reached its bounded limit. Manual review is required."
+                )
+            elif verification == VerificationStatus.FAILED:
+                execution["status"] = "error"
+                execution["error"] = "Mutation postcondition verification failed."
+            elif execution_status == ExecutionStatus.CANCELLED:
+                execution["status"] = "cancelled"
+            elif execution_status == ExecutionStatus.FAILED:
+                execution["status"] = "error"
+                execution["error"] = "Mutation execution failed before an external request started."
+            elif execution_status in {
+                ExecutionStatus.EXECUTING,
+                ExecutionStatus.REPORTED_SUCCESS,
+                ExecutionStatus.UNKNOWN,
+            }:
+                execution["status"] = "executing"
+                execution["result"] = [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Mutation outcome is being reconciled from authoritative "
+                            "infrastructure state."
+                        ),
+                    }
+                ]
+    return projected
+
+
+def mark_active_tool_segments_cancelled(
+    messages: List[Dict[str, Any]],
+    run_id: Optional[str],
+    reason: str,
+) -> List[Dict[str, Any]]:
+    """Mark active tools in the latest assistant turn as a terminal cancellation."""
+    assistant = next(
+        (message for message in reversed(messages) if message.get("type") == "assistant"),
+        None,
+    )
+    if assistant is None:
+        return []
+
+    cancelled: List[Dict[str, Any]] = []
+    segments: List[Dict[str, Any]] = assistant.get("segments", []) or []
+    for segment in segments:
+        if segment.get("kind") != "tool":
+            continue
+        execution = segment.get("toolExecution", {})
+        if execution.get("status") not in ACTIVE_TOOL_STATUSES:
+            continue
+        execution_run_id = execution.get("run_id")
+        if run_id and execution_run_id and str(execution_run_id) != str(run_id):
+            continue
+        execution["status"] = "cancelled"
+        execution["error"] = reason
+        execution["result"] = [{"type": "text", "text": reason}]
+        segment["toolExecution"] = execution
+        cancelled.append(dict(execution))
+
+    assistant["segments"] = segments
+    return cancelled
 
 
 class ConversationPersistenceService:
     def __init__(self):
         self._usage_buffers: Dict[str, Dict[str, Any]] = {}
         self._message: Message | None = None
+
+    async def project_authoritative_mutation_statuses(
+        self, conversation_id: str, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        operations = await MutationOperation.filter(conversation_id=conversation_id).all()
+        return project_mutation_operations(messages, operations)
 
     def _clear_message(self) -> None:
         self._message = None
@@ -495,18 +644,28 @@ class ConversationPersistenceService:
         status: str,
         error: Optional[str] = None,
         result: Optional[List[Dict[str, Any]]] = None,
+        allow_cancelled_transition: bool = False,
     ) -> None:
         conversation = await Conversation.get(id=conversation_id)
         messages: List[Dict[str, Any]] = conversation.messages_json or []
         if not messages:
             return
 
-        assistant = messages[-1]
-        segments: List[Dict[str, Any]] = assistant.get("segments", [])
-        for i in range(len(segments) - 1, -1, -1):
-            seg = segments[i]
-            if seg.get("kind") == "tool" and seg.get("id") == call_id:
+        for assistant in reversed(messages):
+            if assistant.get("type") != "assistant":
+                continue
+            segments: List[Dict[str, Any]] = assistant.get("segments", []) or []
+            for i in range(len(segments) - 1, -1, -1):
+                seg = segments[i]
+                if seg.get("kind") != "tool" or seg.get("id") != call_id:
+                    continue
                 exec_obj = seg.get("toolExecution", {})
+                if (
+                    exec_obj.get("status") == "cancelled"
+                    and status != "cancelled"
+                    and not allow_cancelled_transition
+                ):
+                    return
                 exec_obj["status"] = status
                 if error is not None:
                     exec_obj["error"] = error
@@ -528,6 +687,37 @@ class ConversationPersistenceService:
                             "Could not update tool status metadata on Message row %s", assistant_id
                         )
                 return
+
+    async def cancel_active_tool_segments(
+        self,
+        conversation_id: str,
+        run_id: Optional[str],
+        reason: str = "Cancelled by user",
+    ) -> List[Dict[str, Any]]:
+        conversation = await Conversation.get(id=conversation_id)
+        messages: List[Dict[str, Any]] = conversation.messages_json or []
+        cancelled = mark_active_tool_segments_cancelled(messages, run_id, reason)
+        if not cancelled:
+            return []
+
+        await conversation.update_from_dict({"messages_json": messages}).save()
+        assistant = next(
+            (message for message in reversed(messages) if message.get("type") == "assistant"),
+            None,
+        )
+        assistant_id = assistant.get("id") if assistant else None
+        if assistant_id:
+            try:
+                msg_row = await Message.get(id=uuid.UUID(str(assistant_id)))
+                msg_row.message_metadata = {"segments": assistant.get("segments", [])}
+                await msg_row.save()
+                self._message = msg_row
+            except Exception:
+                logger.exception(
+                    "Failed to persist cancelled tool metadata for message %s",
+                    assistant_id,
+                )
+        return cancelled
 
     async def build_llm_messages(self, conversation: Conversation) -> List[Dict[str, Any]]:
         messages_json: List[Dict[str, Any]] = conversation.messages_json or []

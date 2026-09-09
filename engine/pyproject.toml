@@ -38,6 +38,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0.23",
     "psycopg[binary]>=3.1.0",
     "asyncpg>=0.30.0",
+    "PyYAML>=6.0.2",
 ]
 
 [[project.authors]]

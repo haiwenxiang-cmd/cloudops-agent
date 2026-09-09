@@ -14,10 +14,13 @@ import {
   MdVerifiedUser,
   MdThumbUp,
   MdThumbDown,
+  MdCancel,
+  MdWarning,
 } from "react-icons/md";
 import { cn } from "@/lib/utils";
 import { ToolExecution } from "../../types/chat";
 import { approveToolCall, denyToolCall } from "@/lib/approvals";
+import { mapOperationReliabilityState } from "@/lib/reliabilityPresentation";
 
 interface ToolVisualizationProps {
   toolExecution: ToolExecution;
@@ -56,12 +59,16 @@ const getStatusIcon = (status: string) => {
       return <MdCheck className="w-4 h-4" />;
     case "error":
       return <MdError className="w-4 h-4" />;
+    case "warning":
+      return <MdWarning className="w-4 h-4" />;
     case "awaiting_approval":
       return <MdAccessTime className="w-4 h-4 animate-pulse" />;
     case "approved":
       return <MdVerifiedUser className="w-4 h-4" />;
     case "denied":
       return <MdBlock className="w-4 h-4" />;
+    case "cancelled":
+      return <MdCancel className="w-4 h-4" />;
     default:
       return <MdHourglassEmpty className="w-4 h-4" />;
   }
@@ -75,12 +82,16 @@ const getStatusColor = (status: string) => {
       return "border-emerald-600/40 bg-gradient-to-r from-emerald-500/15 to-emerald-500/5";
     case "error":
       return "border-rose-600/40 bg-gradient-to-r from-rose-500/15 to-rose-500/5";
+    case "warning":
+      return "border-amber-500/40 bg-gradient-to-r from-amber-500/15 to-amber-500/5";
     case "awaiting_approval":
       return "border-blue-600/40 bg-gradient-to-r from-blue-600/15 to-blue-600/5";
     case "approved":
       return "border-green-600/40 bg-gradient-to-r from-green-500/15 to-green-500/5";
     case "denied":
       return "border-slate-600/40 bg-gradient-to-r from-slate-500/15 to-slate-500/5";
+    case "cancelled":
+      return "border-amber-600/40 bg-gradient-to-r from-amber-500/15 to-amber-500/5";
     default:
       return "border-slate-700/40 bg-gradient-to-r from-slate-800/70 to-slate-900/70";
   }
@@ -94,12 +105,16 @@ const getTextColor = (status: string) => {
       return "text-emerald-400";
     case "error":
       return "text-rose-400";
+    case "warning":
+      return "text-amber-400";
     case "awaiting_approval":
       return "text-blue-400";
     case "approved":
       return "text-green-400";
     case "denied":
       return "text-slate-400";
+    case "cancelled":
+      return "text-amber-400";
     default:
       return "text-slate-400";
   }
@@ -241,6 +256,16 @@ export function ToolVisualization({
   const [isApproving, setIsApproving] = useState(false);
   const [isDenying, setIsDenying] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  const reliabilityPresentation = mapOperationReliabilityState(toolExecution);
+  const displayStatus = reliabilityPresentation
+    ? reliabilityPresentation.tone === "warning"
+      ? "warning"
+      : reliabilityPresentation.tone === "danger"
+      ? "error"
+      : reliabilityPresentation.tone === "success"
+      ? "completed"
+      : "executing"
+    : toolExecution.status;
 
   // Auto-collapse when status changes away from awaiting_approval
   useEffect(() => {
@@ -393,7 +418,7 @@ export function ToolVisualization({
       <motion.div
         className={cn(
           "border rounded-lg transition-all duration-300 overflow-hidden",
-          getStatusColor(toolExecution.status)
+          getStatusColor(displayStatus)
         )}
         whileHover={{
           boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
@@ -412,7 +437,7 @@ export function ToolVisualization({
           <div className="flex items-start justify-between">
             <div className="flex items-center">
               <motion.div
-                className={cn("mr-3", getTextColor(toolExecution.status))}
+                className={cn("mr-3", getTextColor(displayStatus))}
                 animate={
                   toolExecution.status === "executing" ||
                   toolExecution.status === "awaiting_approval"
@@ -423,14 +448,14 @@ export function ToolVisualization({
                     : {}
                 }
               >
-                {getStatusIcon(toolExecution.status)}
+                {getStatusIcon(displayStatus)}
               </motion.div>
               <div>
                 <div className="text-sm font-medium text-slate-100">
                   {toolExecution.title}
                 </div>
                 <div className="text-xs text-slate-400 mt-1">
-                  {toolExecution.status === "executing"
+                  {reliabilityPresentation?.label ?? (toolExecution.status === "executing"
                     ? "Executing..."
                     : toolExecution.status === "completed"
                     ? "Completed"
@@ -444,7 +469,9 @@ export function ToolVisualization({
                     ? "Approved"
                     : toolExecution.status === "denied"
                     ? "Denied"
-                    : "Unknown"}
+                    : toolExecution.status === "cancelled"
+                    ? "Cancelled"
+                    : "Unknown")}
                 </div>
               </div>
             </div>
@@ -454,11 +481,11 @@ export function ToolVisualization({
               </span>
               {expanded ? (
                 <MdKeyboardArrowDown
-                  className={getTextColor(toolExecution.status)}
+                  className={getTextColor(displayStatus)}
                 />
               ) : (
                 <MdKeyboardArrowRight
-                  className={getTextColor(toolExecution.status)}
+                  className={getTextColor(displayStatus)}
                 />
               )}
             </div>
@@ -482,6 +509,30 @@ export function ToolVisualization({
               className="bg-dark border-t border-slate-700/50"
             >
               <div className="p-4 space-y-3">
+                {reliabilityPresentation && (
+                  <div
+                    className={cn(
+                      "rounded-md border p-3 text-xs",
+                      displayStatus === "error"
+                        ? "border-rose-600/30 bg-rose-500/5 text-rose-200"
+                        : displayStatus === "warning"
+                        ? "border-amber-500/30 bg-amber-500/5 text-amber-100"
+                        : displayStatus === "completed"
+                        ? "border-emerald-600/30 bg-emerald-500/5 text-emerald-100"
+                        : "border-blue-600/30 bg-blue-500/5 text-blue-100",
+                    )}
+                  >
+                    <div className="font-medium">{reliabilityPresentation.label}</div>
+                    <div className="mt-1 text-slate-300">
+                      {reliabilityPresentation.description}
+                    </div>
+                    {toolExecution.operation_id && (
+                      <div className="mt-2 font-mono text-[11px] text-slate-400 break-all">
+                        Operation: {toolExecution.operation_id}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div>
                   <div className="text-sm text-slate-400 mb-2">Arguments:</div>
                   <pre className="text-xs text-sky-300 font-mono bg-blue-500/5 p-3 rounded-md border border-slate-700/60 whitespace-pre-wrap break-words break-all max-w-full overflow-x-hidden">
@@ -503,6 +554,16 @@ export function ToolVisualization({
                   <div>
                     <div className="text-sm text-slate-400 mb-2">Error:</div>
                     <pre className="text-xs text-rose-300 font-mono bg-blue-500/5 p-3 rounded-md border border-rose-600/30 whitespace-pre-wrap break-words break-all max-w-full overflow-x-hidden">
+                      {toolExecution.error}
+                    </pre>
+                  </div>
+                )}
+                {toolExecution.status === "cancelled" && toolExecution.error && (
+                  <div>
+                    <div className="text-sm text-slate-400 mb-2">
+                      Cancellation reason:
+                    </div>
+                    <pre className="text-xs text-amber-300 font-mono bg-amber-500/5 p-3 rounded-md border border-amber-600/30 whitespace-pre-wrap break-words break-all max-w-full overflow-x-hidden">
                       {toolExecution.error}
                     </pre>
                   </div>

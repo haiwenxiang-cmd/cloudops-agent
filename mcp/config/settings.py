@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     RETRY_MAX_DELAY: int = 300
     RETRY_EXPONENTIAL_BASE: float = 2.0
 
+    COMMAND_READ_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+    COMMAND_MUTATION_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0)
+    COMMAND_TERMINATE_GRACE_SECONDS: float = Field(default=2.0, gt=0)
+    COMMAND_MAX_RETRY_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    COMMAND_RETRY_BASE_DELAY_SECONDS: float = Field(default=0.5, ge=0)
+    COMMAND_RETRY_MAX_DELAY_SECONDS: float = Field(default=5.0, ge=0)
+    COMMAND_RETRY_EXPONENTIAL_BASE: float = Field(default=2.0, ge=1)
+    RUN_CANCEL_TOMBSTONE_TTL_SECONDS: float = Field(default=900.0, gt=0)
+
     ENGINE_INTERNAL_URL: str = Field(default="http://127.0.0.1:8000")
     INTERNAL_API_KEY: str = Field()
 

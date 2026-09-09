@@ -16,23 +16,24 @@ export interface ApprovalResponse {
 export interface StopResponse {
   status: string;
   conversation_id: string;
+  run_id?: string;
+  workflow_cancel_requested?: boolean;
+  workflow_cancelled?: boolean;
+  cancelled_tool_count?: number;
+  partial_reasons?: string[];
 }
 
-const getApiBaseUrl = () => {
-  return process.env.NEXT_PUBLIC_API_URL;
-};
+const getApiBaseUrl = () => process.env.NEXT_PUBLIC_API_URL;
 
-const getClientAuthHeaders = async (): Promise<Record<string, string>> => {
-  return {
-    "Content-Type": "application/json",
-    ...(await getAuthHeaders()),
-  };
-};
+const getClientAuthHeaders = async (): Promise<Record<string, string>> => ({
+  "Content-Type": "application/json",
+  ...(await getAuthHeaders()),
+});
 
 export const approveToolCall = async (
   callId: string,
   reason?: string,
-  conversationId?: string
+  conversationId?: string,
 ): Promise<ApprovalResponse> => {
   const response = await fetch(`${getApiBaseUrl()}/agent/approvals/${callId}`, {
     method: "POST",
@@ -48,7 +49,7 @@ export const approveToolCall = async (
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `Error approving tool call: ${response.statusText} - ${errorText}`
+      `Error approving tool call: ${response.statusText} - ${errorText}`,
     );
   }
 
@@ -58,7 +59,7 @@ export const approveToolCall = async (
 export const denyToolCall = async (
   callId: string,
   reason?: string,
-  conversationId?: string
+  conversationId?: string,
 ): Promise<ApprovalResponse> => {
   const response = await fetch(`${getApiBaseUrl()}/agent/approvals/${callId}`, {
     method: "POST",
@@ -74,7 +75,7 @@ export const denyToolCall = async (
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `Error denying tool call: ${response.statusText} - ${errorText}`
+      `Error denying tool call: ${response.statusText} - ${errorText}`,
     );
   }
 
@@ -83,24 +84,22 @@ export const denyToolCall = async (
 
 export const stopConversation = async (
   conversationId: string,
-  runId: string
+  runId: string,
 ): Promise<StopResponse> => {
-  const body = {
-    conversation_id: conversationId,
-    run_id: runId,
-  };
-
   const response = await fetch(`${getApiBaseUrl()}/agent/stop`, {
     method: "POST",
     headers: await getClientAuthHeaders(),
     credentials: "include",
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      run_id: runId,
+    }),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `Error stopping conversation: ${response.statusText} - ${errorText}`
+      `Error stopping conversation: ${response.statusText} - ${errorText}`,
     );
   }
 

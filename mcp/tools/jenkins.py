@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import subprocess
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +12,8 @@ import httpx
 from pydantic import Field
 
 from config.server import mcp
+from config.settings import settings
+from utils.commands import run_command
 from utils.models import ToolOutput
 
 # -----------------------------
@@ -34,22 +35,20 @@ def _parse_credentials_ref(credentials_ref: str) -> Tuple[str, str]:
     return namespace, name
 
 
-def resolve_credentials_from_k8s(credentials_ref: str) -> Tuple[str, str]:
+async def resolve_credentials_from_k8s(credentials_ref: str) -> Tuple[str, str]:
     namespace, name = _parse_credentials_ref(credentials_ref)
-    try:
-        proc = subprocess.run(
-            ["kubectl", "-n", namespace, "get", "secret", name, "-o", "json"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError("Timeout retrieving credentials Secret via kubectl") from exc
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to get Secret {namespace}/{name}: {e.stderr}") from e
+    result = await run_command(
+        "kubectl",
+        ["-n", namespace, "get", "secret", name, "-o", "json"],
+        timeout_seconds=5.0,
+        retry=True,
+    )
+    if result["error"]:
+        if result.get("error_type") == "timeout":
+            raise TimeoutError("Timeout retrieving credentials Secret via kubectl")
+        raise RuntimeError(f"Failed to get Secret {namespace}/{name}: {result['output']}")
 
-    secret = json.loads(proc.stdout)
+    secret = json.loads(result["output"])
     data = secret.get("data", {}) or {}
 
     b64_username = data.get("username")
@@ -80,7 +79,7 @@ class JenkinsClient:
 
     async def _crumb_headers(self) -> Dict[str, str]:
         try:
-            resp = await self.client.get("/crumbIssuer/api/json")
+            resp = await self._request("GET", "/crumbIssuer/api/json", retry_safe=True)
             if resp.status_code in (403, 404):
                 return {}
             resp.raise_for_status()
@@ -93,8 +92,41 @@ class JenkinsClient:
             return {}
         return {}
 
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        retry_safe: bool,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        max_attempts = settings.COMMAND_MAX_RETRY_ATTEMPTS if retry_safe else 1
+        transient_statuses = {429, 502, 503, 504}
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self.client.request(method, path, **kwargs)
+                if response.status_code not in transient_statuses or attempt == max_attempts:
+                    return response
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                last_error = exc
+                if attempt == max_attempts:
+                    raise
+
+            delay = min(
+                settings.COMMAND_RETRY_BASE_DELAY_SECONDS
+                * (settings.COMMAND_RETRY_EXPONENTIAL_BASE ** (attempt - 1)),
+                settings.COMMAND_RETRY_MAX_DELAY_SECONDS,
+            )
+            await asyncio.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Jenkins request failed without a response")
+
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
-        return await self.client.get(path, params=params)
+        return await self._request("GET", path, params=params, retry_safe=True)
 
     async def post(
         self,
@@ -104,7 +136,13 @@ class JenkinsClient:
     ) -> httpx.Response:
         crumb_hdrs = await self._crumb_headers()
         merged_headers = {**(headers or {}), **crumb_hdrs}
-        return await self.client.post(path, data=data, headers=merged_headers)
+        return await self._request(
+            "POST",
+            path,
+            data=data,
+            headers=merged_headers,
+            retry_safe=False,
+        )
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -141,7 +179,7 @@ def normalize_response(resp: httpx.Response, body_text: Optional[str] = None) ->
 
 
 async def _with_client(api_url: str, credentials_ref: str, verify: bool = True) -> JenkinsClient:
-    username, api_token = resolve_credentials_from_k8s(credentials_ref)
+    username, api_token = await resolve_credentials_from_k8s(credentials_ref)
     return JenkinsClient(api_url, username, api_token, verify=verify)
 
 

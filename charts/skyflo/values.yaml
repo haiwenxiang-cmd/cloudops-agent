@@ -43,6 +43,15 @@ engine:
     memoryContextMaxDocs: "6"
     memoryContextTokenBudget: "2200"
     memoryRequireSourceRefs: "true"
+    environment: "development"
+    mutationControlEnabled: "true"
+    mutationLeaseSeconds: "180"
+    mutationVerificationLeaseSeconds: "120"
+    mutationVerificationTimeoutSeconds: "90"
+    mutationVerificationIntervalSeconds: "2"
+    mutationRecoveryIntervalSeconds: "30"
+    mutationRecoveryGraceSeconds: "15"
+    mutationRecoveryBatchSize: "20"
 
   secrets:
     # Use an existing Secret instead of creating one. The Secret must contain
@@ -118,6 +127,16 @@ mcp:
     tag: ""
     pullPolicy: Always
   replicas: 1
+  rbac:
+    # Emergency compatibility switch only. Keep false for least privilege.
+    clusterAdmin: false
+    mutationNamespaces:
+      - default
+      - skyflo
+    readNamespaces:
+      - default
+      - skyflo
+      - kube-system
   resources:
     requests:
       cpu: 200m
@@ -135,6 +154,13 @@ mcp:
     retryBaseDelay: "60"
     retryMaxDelay: "300"
     retryExponentialBase: "2.0"
+    commandReadTimeoutSeconds: "30"
+    commandMutationTimeoutSeconds: "120"
+    commandTerminateGraceSeconds: "2"
+    commandMaxRetryAttempts: "3"
+    commandRetryBaseDelaySeconds: "0.5"
+    commandRetryMaxDelaySeconds: "5"
+    commandRetryExponentialBase: "2.0"
     # Override auto-computed engine internal URL if needed (default: in-cluster engine service)
     engineInternalUrl: ""
 
@@ -301,3 +327,6 @@ networkPolicy:
   allowAllEgress: false
   # Optional override when the chart cannot resolve the Kubernetes API service cluster IP.
   kubernetesApiServerCIDR: ""
+  # Kubernetes API endpoint port used with kubernetesApiServerCIDR.
+  # kind commonly exposes the control-plane endpoint on 6443 after service DNAT.
+  kubernetesApiServerPort: 443

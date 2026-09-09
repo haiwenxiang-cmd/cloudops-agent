@@ -1,7 +1,12 @@
+import secrets
 import shutil
+import uuid
 
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
+
+from config.settings import settings
+from utils.commands import cancel_run_processes
 
 mcp = FastMCP(
     "Skyflo MCP Server",
@@ -29,6 +34,22 @@ async def health_ready(request):
     if missing_tools:
         return JSONResponse({"status": "error", "missing_tools": missing_tools}, status_code=503)
     return JSONResponse({"status": "ready"})
+
+
+@mcp.custom_route("/internal/runs/{run_id}/cancel", methods=["POST"])
+async def cancel_run(request):
+    supplied_key = request.headers.get("x-internal-api-key", "")
+    if not secrets.compare_digest(supplied_key, settings.INTERNAL_API_KEY):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    raw_run_id = request.path_params.get("run_id", "")
+    try:
+        run_id = str(uuid.UUID(raw_run_id))
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse({"detail": "Invalid run_id"}, status_code=400)
+
+    result = await cancel_run_processes(run_id)
+    return JSONResponse({"run_id": run_id, **result})
 
 
 # Import tool modules to register them with the MCP server

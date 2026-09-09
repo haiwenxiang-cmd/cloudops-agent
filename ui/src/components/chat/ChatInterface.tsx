@@ -14,7 +14,11 @@ import { PendingApprovalsBar } from "./PendingApprovalsBar";
 import { QueuedMessagesBar } from "./QueuedMessagesBar";
 import { stopConversation } from "@/lib/approvals";
 import { isHiddenSystemTool } from "@/lib/hiddenTools";
-import { showError } from "@/components/ui/toast";
+import { showError, showInfo, showWarning } from "@/components/ui/toast";
+import {
+  mapRunTerminalState,
+  mapStreamRecoveryState,
+} from "@/lib/reliabilityPresentation";
 
 const createEmptyUsage = (): TokenUsage => ({
   prompt_tokens: 0,
@@ -230,6 +234,13 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
     timestamp: execution.timestamp,
     error: execution.error,
     requires_approval: (execution as any).requires_approval,
+    requires_verification: execution.requires_verification,
+    operation_id: execution.operation_id,
+    execution_status: execution.execution_status,
+    verification_status: execution.verification_status,
+    verification_reason: execution.verification_reason,
+    partial_commit_detected: execution.partial_commit_detected,
+    run_id: execution.run_id,
   });
 
   const updateMessageWithTool = useCallback(
@@ -431,7 +442,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
   );
 
   useEffect(() => {
-    chatServiceRef.current = new ChatService({
+    const chatService = new ChatService({
       onToolExecuting: updateMessageWithTool,
       onToolResult: updateExistingMessageWithTool,
       onToolsPending: addPendingTools,
@@ -439,6 +450,50 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
       onToolApproved: updateExistingMessageWithTool,
       onToolDenied: updateMessageWithTool,
       onToolError: updateMessageWithTool,
+      onToolCancelled: updateExistingMessageWithTool,
+      onRecoveryRequired: (notice) => {
+        const recovery = mapStreamRecoveryState(notice.reason);
+        showInfo(`${recovery.label}. ${recovery.description}`, {
+          autoClose: 12000,
+        });
+        setIsStreaming(false);
+        setWaitingForFirstUpdate(false);
+        updateCurrentMessage(null);
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("conversation:reload-authoritative", {
+              detail: { conversationId: notice.conversationId },
+            }),
+          );
+        }
+      },
+
+      onRunTerminal: (notice) => {
+        const recovery = mapRunTerminalState({
+          status: notice.status,
+          partial_reasons: notice.partialReasons,
+        });
+        if (recovery) {
+          showWarning(`${recovery.label}. ${recovery.description}`, {
+            autoClose: 20000,
+          });
+        }
+        if (
+          typeof window !== "undefined" &&
+          notice.status !== "awaiting_approval"
+        ) {
+          // The Journal is authoritative for mutation recovery fields. Refresh
+          // after a terminal event so a background reconciliation is reflected
+          // immediately instead of waiting for the periodic safety refresh.
+          window.setTimeout(() => {
+            window.dispatchEvent(
+              new CustomEvent("conversation:reload-authoritative", {
+                detail: { conversationId },
+              }),
+            );
+          }, 0);
+        }
+      },
 
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       onThinking: (token: string, _conversationId: string) => {
@@ -794,6 +849,17 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
         });
       },
     });
+    chatServiceRef.current = chatService;
+
+    const persistedRunId = chatService.getPersistedRunId(conversationId);
+    if (persistedRunId) {
+      hasFinalizedRef.current = false;
+      setCurrentRunId(persistedRunId);
+      setIsStreaming(true);
+      setWaitingForFirstUpdate(true);
+      requestStartTimeRef.current = Date.now();
+      void chatService.resumePersistedStream(conversationId);
+    }
 
     return () => {
       chatServiceRef.current?.disconnect();
@@ -810,7 +876,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
 
   useEffect(() => {
     let isMounted = true;
-    const fetchConversation = async () => {
+    const fetchConversation = async (force = false) => {
       try {
         const res = await fetch(`/api/conversation/${conversationId}`, {
           cache: "no-store",
@@ -845,24 +911,81 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
           return baseMessage;
         });
 
-        setMessages((prev) => (prev.length > 0 ? prev : hydrated));
+        setMessages((prev) => (force || prev.length === 0 ? hydrated : prev));
       } catch (e) {
         void e;
       }
     };
-    fetchConversation();
+    const handleAuthoritativeReload = (event: Event) => {
+      const detail = (event as CustomEvent<{ conversationId?: string }>).detail;
+      if (detail?.conversationId === conversationId) {
+        void fetchConversation(true);
+      }
+    };
+    window.addEventListener(
+      "conversation:reload-authoritative",
+      handleAuthoritativeReload,
+    );
+    void fetchConversation();
     return () => {
       isMounted = false;
+      window.removeEventListener(
+        "conversation:reload-authoritative",
+        handleAuthoritativeReload,
+      );
     };
   }, [conversationId]);
 
+  const hasUnresolvedMutation = useMemo(
+    () =>
+      messages.some(
+        (message) =>
+          message.type === "assistant" &&
+          Array.isArray(message.segments) &&
+          message.segments.some(
+            (segment) =>
+              segment.kind === "tool" &&
+              Boolean((segment.toolExecution as any).requires_verification),
+          ),
+      ),
+    [messages],
+  );
+
+  useEffect(() => {
+    if (isStreaming || !hasUnresolvedMutation) return;
+    const interval = window.setInterval(() => {
+      window.dispatchEvent(
+        new CustomEvent("conversation:reload-authoritative", {
+          detail: { conversationId },
+        }),
+      );
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [conversationId, hasUnresolvedMutation, isStreaming]);
+
   const handleCancel = useCallback(async () => {
+    const runId = currentRunId;
+    // Abort the browser's fetch/SSE reader immediately. The stop endpoint below
+    // remains the authoritative server-side cancellation signal.
+    chatServiceRef.current?.disconnect(true);
+
     try {
-      if (!currentRunId) {
+      if (!runId) {
         return;
       }
-      await stopConversation(conversationId, currentRunId);
+      const stopResult = await stopConversation(conversationId, runId);
+      const recovery = mapRunTerminalState(stopResult);
+      if (recovery) {
+        showWarning(`${recovery.label}. ${recovery.description}`, {
+          autoClose: 20000,
+        });
+      } else if (stopResult.status !== "stopped") {
+        showError(
+          "The local stream stopped, but the server could not confirm every remote process was terminated. Check the mutation journal before retrying a write operation.",
+        );
+      }
     } catch (e) {
+      showError(e instanceof Error ? e.message : "Failed to confirm server-side stop");
     } finally {
       setIsStreaming(false);
       setWaitingForFirstUpdate(false);
@@ -875,12 +998,35 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
       setCurrentRunId(null);
       updateCurrentMessage((prev) => {
         if (!prev) return null;
+        const activeStatuses = new Set([
+          "pending",
+          "executing",
+          "approved",
+          "awaiting_approval",
+        ]);
+        const cancelledSegments = prev.segments?.map((segment) => {
+          if (
+            segment.kind !== "tool" ||
+            !activeStatuses.has(segment.toolExecution.status)
+          ) {
+            return segment;
+          }
+          return {
+            ...segment,
+            toolExecution: {
+              ...segment.toolExecution,
+              status: "cancelled" as const,
+              error: "Cancelled by user",
+            },
+          };
+        });
         const hasContent =
           (prev.content && prev.content.trim().length > 0) ||
           (Array.isArray(prev.segments) && prev.segments.length > 0);
         if (hasContent) {
           const finalMessage = {
             ...prev,
+            segments: cancelledSegments,
             isStreaming: false,
           } as ChatMessageType;
           setMessages((msgs) => {
@@ -897,10 +1043,9 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps) {
         }
         return null;
       });
-      chatServiceRef.current?.disconnect();
       hasFinalizedRef.current = true;
     }
-  }, [conversationId, currentRunId, updateCurrentMessage]);
+  }, [conversationId, currentRunId, showError, updateCurrentMessage]);
 
   const handleSendMessage = useCallback(
     async (message: string) => {

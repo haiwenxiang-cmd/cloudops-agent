@@ -63,6 +63,17 @@ export interface ToolErrorEvent {
   timestamp: number;
 }
 
+export interface ToolCancelledEvent {
+  type: "tool.cancelled";
+  call_id: string;
+  tool: string;
+  title: string;
+  args: Record<string, any>;
+  error: string;
+  run_id: string;
+  timestamp: number;
+}
+
 export interface ToolsPendingEvent {
   type: "tools.pending";
   run_id: string;
@@ -133,16 +144,25 @@ export interface ErrorEvent {
 
 export interface CompletedEvent {
   type: "completed";
-  status: "completed" | "error" | "stopped";
+  status: "completed" | "error" | "stopped" | "stop_partial" | "recovered";
   run_id?: string;
   duration_ms?: number;
+  partial_reasons?: string[];
 }
 
 export interface WorkflowCompleteEvent {
   type: "workflow_complete";
   run_id: string;
   result?: any;
-  status: "completed" | "awaiting_approval" | "stopped";
+  status:
+    | "completed"
+    | "error"
+    | "awaiting_approval"
+    | "stopped"
+    | "stop_partial"
+    | "recovered";
+  partial_reasons?: string[];
+  duration_ms?: number;
 }
 
 export interface WorkflowErrorEvent {
@@ -231,6 +251,7 @@ export type Event =
   | ToolDeniedEvent
   | ToolApprovedEvent
   | ToolErrorEvent
+  | ToolCancelledEvent
   | ToolsPendingEvent
   | ThinkingEvent
   | ThinkingCompleteEvent

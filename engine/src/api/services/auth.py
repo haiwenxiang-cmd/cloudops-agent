@@ -12,6 +12,7 @@ from fastapi_users.authentication import (
     BearerTransport,
     JWTStrategy,
 )
+from fastapi_users.exceptions import UserNotExists
 from fastapi_users.manager import BaseUserManager, UUIDIDMixin
 from fastapi_users_tortoise import TortoiseUserDatabase
 from tortoise.transactions import in_transaction
@@ -40,8 +41,12 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
     ) -> None:
         logger.info(f"Verification requested for user {user.id}.")
 
-    async def get_by_email(self, email: str) -> Optional[User]:
-        return await User.get_or_none(email=email)
+    async def get_by_email(self, email: str) -> User:
+        user = await User.get_or_none(email=email)
+        if user is None:
+            # BaseUserManager.authenticate expects this domain exception.
+            raise UserNotExists()
+        return user
 
     async def get_by_id(self, id: uuid.UUID) -> Optional[User]:
         return await User.get_or_none(id=id)

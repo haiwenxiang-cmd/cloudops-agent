@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -15,6 +16,8 @@ from ..memory.tools import MEMORY_TOOL_NAMES
 from ..services.approvals import ApprovalService
 from ..services.checkpointer import get_checkpointer
 from ..services.mcp_client import MCPClient
+from ..services.mutation_utils import redact_tool_args
+from ..services.mutation_verifier import MutationVerifier
 from ..services.stop_service import clear_stop
 from ..services.tool_executor import AVAILABLE_TOOLSETS, ToolExecutor
 from ..utils.clock import now_ms
@@ -58,26 +61,43 @@ def _inject_memory_context(state: Dict[str, Any], tool_args: Dict[str, Any]) -> 
 EventCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
-def route_after_model(state: Dict[str, Any]) -> Literal["gate", "final"]:
+def route_after_model(state: Dict[str, Any]) -> Literal["gate", "verification", "final"]:
     pending_tools = get_state_value(state, "pending_tools", [])
 
     if pending_tools:
         return "gate"
+
+    if get_state_value(state, "verification_required", False):
+        return "verification"
 
     return "final"
 
 
-def route_from_entry(state: Dict[str, Any]) -> Literal["gate", "memory_prepare"]:
+def route_from_entry(
+    state: Dict[str, Any],
+) -> Literal["gate", "verification", "memory_prepare"]:
     pending_tools = get_state_value(state, "pending_tools", [])
     if pending_tools:
         return "gate"
+    if get_state_value(state, "verification_required", False):
+        return "verification"
     return "memory_prepare"
 
 
-def route_after_gate(state: Dict[str, Any]) -> Literal["model", "final"]:
+def route_after_gate(state: Dict[str, Any]) -> Literal["model", "verification", "final"]:
     if get_state_value(state, "awaiting_approval", False):
         return "final"
     if get_state_value(state, "error"):
+        return "final"
+    if get_state_value(state, "verification_required", False):
+        return "verification"
+    return "model"
+
+
+def route_after_verification(state: Dict[str, Any]) -> Literal["model", "final"]:
+    if get_state_value(state, "verification_blocked", False):
+        return "final"
+    if get_state_value(state, "verification_required", False):
         return "final"
     return "model"
 
@@ -97,6 +117,10 @@ class WorkflowGraph:
             mcp_client=self.mcp_client,
             owns_client=False,
         )
+        self.mutation_verifier = MutationVerifier(
+            mcp_client=self.mcp_client,
+            journal=self.tool_executor.mutation_journal,
+        )
         self.model_node = ModelNode(
             event_callback=self.event_callback,
             tools_provider=self.tool_executor.get_llm_compatible_tools,
@@ -114,18 +138,32 @@ class WorkflowGraph:
         workflow.add_node("memory_prepare", self._memory_prepare_node)
         workflow.add_node("model", self._model_node)
         workflow.add_node("gate", self._gate_node)
+        workflow.add_node("verification", self._verification_node)
         workflow.add_node("final", self._final_node)
 
         workflow.add_edge(START, "entry")
         workflow.add_conditional_edges(
-            "entry", route_from_entry, {"gate": "gate", "memory_prepare": "memory_prepare"}
+            "entry",
+            route_from_entry,
+            {
+                "gate": "gate",
+                "verification": "verification",
+                "memory_prepare": "memory_prepare",
+            },
         )
         workflow.add_edge("memory_prepare", "model")
         workflow.add_conditional_edges(
-            "model", route_after_model, {"gate": "gate", "final": "final"}
+            "model",
+            route_after_model,
+            {"gate": "gate", "verification": "verification", "final": "final"},
         )
         workflow.add_conditional_edges(
-            "gate", route_after_gate, {"model": "model", "final": "final"}
+            "gate",
+            route_after_gate,
+            {"model": "model", "verification": "verification", "final": "final"},
+        )
+        workflow.add_conditional_edges(
+            "verification", route_after_verification, {"model": "model", "final": "final"}
         )
         workflow.add_edge("final", END)
 
@@ -163,6 +201,8 @@ class WorkflowGraph:
             "ttft_emitted": False,
             "memory_context_loaded": False,
             "memory_context_msg": None,
+            "error": None,
+            "verification_blocked": False,
         }
         if get_state_value(state, "awaiting_approval", False):
             updates["awaiting_approval"] = False
@@ -313,7 +353,7 @@ class WorkflowGraph:
                                     "call_id": display_id,
                                     "tool": tool_name,
                                     "title": title_value,
-                                    "args": tool_args,
+                                    "args": redact_tool_args(tool_name, tool_args),
                                     "requires_approval": requires_approval_value,
                                     "timestamp": now_ms(),
                                 }
@@ -334,6 +374,17 @@ class WorkflowGraph:
                 pass
 
             tool_messages = []
+            mutation_operations = list(get_state_value(state, "mutation_operations", []))
+            # A Gate invocation may be resuming a checkpoint after a later tool in
+            # the same batch paused for approval.  Rebuild this invariant from the
+            # durable per-operation metadata instead of resetting it for the new
+            # invocation; otherwise an earlier executed mutation can skip
+            # verification when the resumed tool is denied or is not controlled.
+            verification_required = any(
+                bool(item.get("requires_verification"))
+                for item in mutation_operations
+                if isinstance(item, dict)
+            )
             loaded_toolsets = dict(get_state_value(state, "loaded_toolsets", {"k8s": False}))
             toolsets_changed = False
 
@@ -366,13 +417,31 @@ class WorkflowGraph:
                         args=tool_args,
                         context={
                             "conversation_id": get_state_value(state, "conversation_id"),
+                            "user_id": get_state_value(state, "user_id"),
+                            "user_role": get_state_value(state, "user_role"),
+                            "environment": get_state_value(
+                                state, "environment", settings.SKYFLO_ENVIRONMENT
+                            ),
                             "approval_decisions": get_state_value(state, "approval_decisions", {}),
+                            "approval_reasons": get_state_value(state, "approval_reasons", {}),
                         },
                         call_id=display_id,
+                        operation_id=tool_call.get("operation_id"),
                     )
 
                     result_content = ""
                     for block in tool_results:
+                        if block.get("type") == "skyflo.mutation":
+                            mutation_operations = [
+                                item
+                                for item in mutation_operations
+                                if item.get("operation_id") != block.get("operation_id")
+                            ]
+                            mutation_operations.append(block)
+                            verification_required = verification_required or bool(
+                                block.get("requires_verification")
+                            )
+                            continue
                         if block.get("type") == "text":
                             result_content += block.get("text", "")
                         else:
@@ -393,6 +462,9 @@ class WorkflowGraph:
                         "pending_tools": remaining_tools,
                         "awaiting_approval": True,
                         "suppress_pending_event": False,
+                        "mutation_operations": mutation_operations,
+                        "verification_required": verification_required,
+                        "verification_blocked": False,
                     }
                     if toolsets_changed:
                         result["loaded_toolsets"] = loaded_toolsets
@@ -414,6 +486,9 @@ class WorkflowGraph:
                 "pending_tools": [],
                 "awaiting_approval": False,
                 "suppress_pending_event": False,
+                "mutation_operations": mutation_operations,
+                "verification_required": verification_required,
+                "verification_blocked": False,
             }
             if toolsets_changed:
                 result["loaded_toolsets"] = loaded_toolsets
@@ -434,6 +509,182 @@ class WorkflowGraph:
                 "error": str(e),
                 "suppress_pending_event": False,
             }
+
+    async def _verification_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Enforce postconditions without asking the model to remember to verify."""
+        await check_stop(state)
+        pending = [
+            item
+            for item in get_state_value(state, "mutation_operations", [])
+            if item.get("requires_verification")
+        ]
+        if not pending:
+            return {"verification_required": False, "verification_blocked": False}
+
+        evidence: List[Dict[str, Any]] = []
+        updated_operations = list(get_state_value(state, "mutation_operations", []))
+        for item in pending:
+            operation_id = item.get("operation_id")
+            if self.event_callback:
+                await self.event_callback(
+                    {
+                        "type": "mutation.verifying",
+                        "run_id": get_state_value(state, "run_id"),
+                        "call_id": item.get("call_id"),
+                        "operation_id": operation_id,
+                        "tool": item.get("tool"),
+                        "timestamp": now_ms(),
+                    }
+                )
+            try:
+                result = await self.mutation_verifier.verify(
+                    operation_id,
+                    lease_owner=f"foreground:{get_state_value(state, 'run_id', 'unknown')}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Deterministic verification failed for %s", operation_id)
+                result = {
+                    "passed": False,
+                    "inconclusive": True,
+                    "status": "inconclusive",
+                    "operation": {"operation_id": operation_id},
+                    "evidence": {
+                        "reason": "verification_runtime_error",
+                        "detail": type(exc).__name__,
+                    },
+                }
+            evidence.append(result)
+            replacement = dict(item)
+            verification_status = result.get("status", "inconclusive")
+            replacement["verification_status"] = verification_status
+            replacement["requires_verification"] = verification_status in {
+                "pending",
+                "verifying",
+                "inconclusive",
+            }
+            updated_operations = [
+                replacement if op.get("operation_id") == operation_id else op
+                for op in updated_operations
+            ]
+            if self.event_callback:
+                await self.event_callback(
+                    {
+                        "type": (
+                            "mutation.verified"
+                            if result.get("passed")
+                            else (
+                                "mutation.manual_review_required"
+                                if result.get("status") == "needs_review"
+                                else
+                                "mutation.verification_failed"
+                                if result.get("status") == "failed"
+                                else "mutation.inconclusive"
+                            )
+                        ),
+                        "run_id": get_state_value(state, "run_id"),
+                        "operation_id": operation_id,
+                        "tool": item.get("tool"),
+                        "verification_status": result.get("status"),
+                        "evidence": result.get("evidence"),
+                        "timestamp": now_ms(),
+                    }
+                )
+                if result.get("passed"):
+                    await self.event_callback(
+                        {
+                            "type": "tool.result",
+                            "run_id": get_state_value(state, "run_id"),
+                            "call_id": item.get("call_id"),
+                            "tool": item.get("tool"),
+                            "title": item.get("title") or item.get("tool"),
+                            "result": item.get("display_result")
+                            or [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Mutation completed and deterministic runtime "
+                                        "verification passed."
+                                    ),
+                                }
+                            ],
+                            "timestamp": now_ms(),
+                        }
+                    )
+                else:
+                    await self.event_callback(
+                        {
+                            "type": "tool.error",
+                            "run_id": get_state_value(state, "run_id"),
+                            "call_id": item.get("call_id"),
+                            "tool": item.get("tool"),
+                            "title": item.get("title") or item.get("tool"),
+                            "error": (
+                                "Mutation outcome could not be verified; success reporting "
+                                "is blocked."
+                            ),
+                            "timestamp": now_ms(),
+                        }
+                    )
+
+        all_passed = all(item.get("passed") for item in evidence)
+        if all_passed:
+            summary = {
+                "role": "system",
+                "content": (
+                    "Skyflo deterministic runtime verification passed for mutation operations: "
+                    + ", ".join(item["operation"]["operation_id"] for item in evidence)
+                    + ". You may report success using this evidence."
+                ),
+            }
+            return {
+                "messages": [summary],
+                "mutation_operations": updated_operations,
+                "verification_required": False,
+                "verification_blocked": False,
+                "verification_evidence": evidence,
+                "error": None,
+            }
+
+        failed_ids = [
+            item.get("operation", {}).get("operation_id", "unknown")
+            for item in evidence
+            if not item.get("passed")
+        ]
+        message = (
+            "Mutation result was not verified. Skyflo runtime blocks any success claim. "
+            "Operation IDs: "
+            + ", ".join(failed_ids)
+        )
+        if self.event_callback:
+            await self.event_callback(
+                {
+                    "type": "token",
+                    "text": message,
+                    "conversation_id": get_state_value(state, "conversation_id"),
+                    "run_id": get_state_value(state, "run_id"),
+                }
+            )
+            await self.event_callback(
+                {
+                    "type": "workflow.error",
+                    "run_id": get_state_value(state, "run_id"),
+                    "error": message,
+                    "timestamp": now_ms(),
+                }
+            )
+        still_pending = any(
+            bool(item.get("requires_verification")) for item in updated_operations
+        )
+        return {
+            "messages": [{"role": "assistant", "content": message}],
+            "mutation_operations": updated_operations,
+            "verification_required": still_pending,
+            "verification_blocked": True,
+            "verification_evidence": evidence,
+            "error": message,
+        }
 
     def _handle_load_toolset(
         self,
@@ -475,21 +726,6 @@ class WorkflowGraph:
         end_time = time.time()
         start_time = get_state_value(state, "start_time", end_time)
         duration = end_time - start_time
-        duration_ms = int(duration * 1000)
-        workflow_error = get_state_value(state, "error")
-
-        if self.event_callback:
-            await self.event_callback(
-                {
-                    "type": "completed",
-                    "status": "error" if workflow_error else "completed",
-                    "run_id": get_state_value(state, "run_id"),
-                    "duration": duration,
-                    "duration_ms": duration_ms,
-                    **({"error": workflow_error} if workflow_error else {}),
-                }
-            )
-
         return {"done": True, "end_time": end_time, "duration": duration}
 
     async def invoke(self, initial_state: Dict[str, Any], **kwargs):
@@ -521,70 +757,56 @@ class WorkflowGraph:
                 end_time = time.time()
                 start_time = get_state_value(initial_state, "start_time", end_time)
                 duration = end_time - start_time
-                duration_ms = int(duration * 1000)
-
-                if self.event_callback:
-                    await self.event_callback(
-                        {
-                            "type": "completed",
-                            "status": "stopped",
-                            "run_id": get_state_value(initial_state, "run_id"),
-                            "duration": duration,
-                            "duration_ms": duration_ms,
-                        }
-                    )
                 try:
-                    await clear_stop(get_state_value(initial_state, "conversation_id"))
+                    await clear_stop(get_state_value(initial_state, "run_id"))
                 except Exception:
                     pass
-                return {"done": True, "stopped": True}
+                return {"done": True, "stopped": True, "duration": duration}
             except GraphRecursionError:
+                error_message = (
+                    f"The AI Agent has reached the maximum number of iterations "
+                    f"of {settings.LLM_MAX_ITERATIONS} for the current prompt. "
+                    f"You can continue the conversation. If you want to update "
+                    f"the max iterations, update the LLM_MAX_ITERATIONS "
+                    f"environment variable."
+                )
                 if self.event_callback:
                     await self.event_callback(
                         {
                             "type": "workflow.error",
                             "run_id": get_state_value(initial_state, "run_id"),
-                            "error": (
-                                f"The AI Agent has reached the maximum number of iterations "
-                                f"of {settings.LLM_MAX_ITERATIONS} for the current prompt. "
-                                f"You can continue the conversation. If you want to update "
-                                f"the max iterations, update the LLM_MAX_ITERATIONS "
-                                f"environment variable."
-                            ),
+                            "error": error_message,
                         }
                     )
+                return {"done": True, "error": error_message}
             except Exception as e:
+                error_message = f"An unknown error occurred while executing the workflow: {e}"
                 if self.event_callback:
                     await self.event_callback(
                         {
                             "type": "workflow.error",
                             "run_id": get_state_value(initial_state, "run_id"),
-                            "error": (
-                                f"An unknown error occurred while executing the workflow: {e}"
-                            ),
+                            "error": error_message,
                         }
                     )
+                return {"done": True, "error": error_message}
 
         except Exception as e:
+            error_message = f"An unknown error occurred while executing the workflow: {e}"
             if self.event_callback:
                 await self.event_callback(
                     {
                         "type": "workflow.error",
                         "run_id": get_state_value(initial_state, "run_id"),
-                        "error": f"An unknown error occurred while executing the workflow: {e}",
+                        "error": error_message,
                     }
                 )
+            return {"done": True, "error": error_message}
 
     async def close(self):
         try:
             await self.tool_executor.close()
             await self.approval_service.close()
-
-            if self.checkpointer and hasattr(self.checkpointer, "aclose"):
-                await self.checkpointer.aclose()
-            elif self.checkpointer and hasattr(self.checkpointer, "conn"):
-                if hasattr(self.checkpointer.conn, "aclose"):
-                    await self.checkpointer.conn.aclose()
 
         except Exception as e:
             logger.error(f"Error closing workflow resources: {str(e)}")

@@ -1,6 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $dnsService := lookup "v1" "Service" "kube-system" "kube-dns" }}
 {{- $apiService := lookup "v1" "Service" "default" "kubernetes" }}
+{{- $apiEndpoints := lookup "v1" "Endpoints" "default" "kubernetes" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -28,14 +29,13 @@ spec:
         {{- if and $dnsService $dnsService.spec $dnsService.spec.clusterIP }}
         - ipBlock:
             cidr: {{ printf "%s/32" $dnsService.spec.clusterIP | quote }}
-        {{- else }}
+        {{- end }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:
               k8s-app: kube-dns
-        {{- end }}
       ports:
         - protocol: UDP
           port: 53
@@ -45,9 +45,6 @@ spec:
         {{- if and $apiService $apiService.spec $apiService.spec.clusterIP }}
         - ipBlock:
             cidr: {{ printf "%s/32" $apiService.spec.clusterIP | quote }}
-        {{- else if .Values.networkPolicy.kubernetesApiServerCIDR }}
-        - ipBlock:
-            cidr: {{ .Values.networkPolicy.kubernetesApiServerCIDR | quote }}
         {{- else }}
         - namespaceSelector:
             matchLabels:
@@ -59,6 +56,33 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    {{- /*
+      Some CNIs evaluate egress policy after kube-proxy has DNATed the
+      kubernetes Service IP to a real API endpoint. Permit those discovered
+      endpoint addresses as well as the stable ClusterIP above.
+    */}}
+    {{- if and $apiEndpoints $apiEndpoints.subsets }}
+    {{- range $subset := $apiEndpoints.subsets }}
+    {{- range $address := $subset.addresses }}
+    - to:
+        - ipBlock:
+            cidr: {{ printf "%s/32" $address.ip | quote }}
+      ports:
+        {{- range $port := $subset.ports }}
+        - protocol: TCP
+          port: {{ $port.port }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.kubernetesApiServerCIDR }}
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.kubernetesApiServerCIDR | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.kubernetesApiServerPort | default 443 }}
+    {{- end }}
     - to:
         - podSelector:
             matchLabels:

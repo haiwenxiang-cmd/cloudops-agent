@@ -17,6 +17,7 @@ TORTOISE_ORM_CONFIG = {
                 "src.api.models.conversation",
                 "src.api.models.integration",
                 "src.api.models.memory",
+                "src.api.models.mutation",
                 "aerich.models",
             ],
             "default_connection": "default",

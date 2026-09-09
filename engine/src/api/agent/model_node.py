@@ -474,6 +474,7 @@ async def run_model_turn(
                         {
                             "id": original_id,
                             "call_id": display_id,
+                            "operation_id": str(uuid.uuid4()),
                             "name": tool_name,
                             "args": args,
                         }

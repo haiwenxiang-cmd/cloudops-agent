@@ -1,181 +1,24 @@
-<p align="center">
-  <a href="https://skyflo.ai">
-    <img src="https://skyflo.ai/assets/hero.png" alt="Skyflo – Self-Hosted AI Agent for Kubernetes and CI/CD" width="1000"/>
-  </a>
-</p>
+# Skyflo Reliability Enhanced
 
-<h3 align="center">Self-Hosted AI Agent for Kubernetes & CI/CD</h3>
+面向 Kubernetes 与 Helm 场景的云原生运维 Agent 平台，通过自然语言完成状态诊断、变更审批、工具执行、结果核验与流式交互。
 
-<p align="center">
-  <a href="https://github.com/skyflo-ai/skyflo/actions">
-    <img src="https://img.shields.io/github/actions/workflow/status/skyflo-ai/skyflo/ci.yml?branch=main&label=CI" alt="CI Status">
-  </a>&nbsp;
-  <a href="https://github.com/skyflo-ai/skyflo/releases">
-    <img src="https://img.shields.io/github/v/release/skyflo-ai/skyflo" alt="Release">
-  </a>&nbsp;
-  <a href="https://github.com/skyflo-ai/skyflo/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/skyflo-ai/skyflo" alt="License">
-  </a>
-</p>
+## 核心能力
 
-<p align="center">
-  <a href="https://skyflo.ai/docs">Docs</a> ·
-  <a href="https://skyflo.ai/docs/architecture">Architecture</a> ·
-  <a href="https://discord.gg/kCFNavMund">Discord</a>
-</p>
+- 基于 LangGraph 组织多轮模型决策、工具调用与上下文状态。
+- 通过 MCP 接入 Kubernetes、Helm 等运维工具，并按能力、角色和命名空间控制执行范围。
+- 对变更操作提供人工审批、幂等标识、执行记录和未知结果核验。
+- 将变更后的只读核验作为运行时约束，避免未经验证就返回成功。
+- 支持任务停止、远程进程清理、SSE 事件重放与会话恢复。
+- 提供 Helm Chart，可部署 Engine、MCP、UI、Controller、PostgreSQL 与 Redis。
 
----
+## 技术栈
 
-Infrastructure automation tools fall into two categories.
+Python、FastAPI、LangGraph、LiteLLM、MCP、PostgreSQL、Redis、Next.js、Kubernetes、Helm、Docker
 
-CLI assistants translate prompts into shell commands.
-Autonomous agents execute infrastructure changes without explicit approval.
+## 运行与测试
 
-Neither model guarantees a deterministic execution process or a complete audit trail. And neither one remembers what happened last time.
+环境变量模板位于 `engine/.env.example`、`mcp/.env.example` 和 `ui/.env.example`。部署配置位于 `charts/skyflo`，Engine 与 MCP 的测试分别位于各自的 `tests` 目录。
 
-Skyflo is a **self-hosted AI agent for Kubernetes and CI/CD systems**. It runs inside your cluster and executes infrastructure operations through a deterministic control loop:
+## License
 
-**Recall → Plan → Approve → Execute → Verify → Persist**
-
-> Every mutating tool call is approval-gated, typed, and auditable. Every confirmed incident lesson is saved and recalled on the next relevant task.
-
-Skyflo is not a CLI wrapper, not an autonomous mutation bot, and not a GitOps control plane.
-
-It is an **in-cluster AI control layer** that enforces safe infrastructure changes before anything reaches production -- and builds operational memory across every session.
-
----
-
-### Quick Start
-
-Install Skyflo inside your Kubernetes cluster.
-
-#### Using `Helm`:
-
-```bash
-helm repo add skyflo https://charts.skyflo.ai
-helm repo update skyflo
-```
-
-Create a `values.yaml` file:
-
-```yaml
-engine:
-  secrets:
-    llmModel: "gemini/gemini-2.5-pro"
-    geminiApiKey: "AI-..."
-```
-
-See `helm show values skyflo/skyflo` for the full list of configurable values.
-
-```bash
-helm install skyflo skyflo/skyflo -n skyflo --create-namespace -f values.yaml
-```
-
-#### Using `curl`:
-
-Get started quickly with the interactive installer.
-
-```bash
-curl -fsSL https://skyflo.ai/install.sh | bash
-```
-
-Bring your own LLM (OpenAI, Anthropic, Gemini, Groq, self-hosted). See the [quick start](https://skyflo.ai/docs/quick-start) guide.
-
----
-
-### Execution Model
-
-Skyflo enforces a strict loop for every infrastructure change:
-
-1. **Recall**: retrieve prior incidents, runbooks, and service context from scoped memory
-2. **Plan**: generate a concrete, replayable plan
-3. **Approve**: explicit approval for every mutating tool call
-4. **Execute**: run typed tools via MCP (Kubernetes, Helm, Argo Rollouts, Jenkins)
-5. **Verify**: validate cluster state against declared intent
-6. **Persist**: store tool-level audit history and save confirmed lessons to memory
-
-No blind `kubectl apply`. No silent automation. No untracked changes.
-
----
-
-### Safety Properties
-
-* Approval gate for every mutating tool call, enforced by the engine
-* Typed tool execution with schema-validated inputs
-* Persisted audit trail with tool results
-* Replayable control loop (recall → plan → approve → execute → verify → persist)
-* Scoped memory with safety scanning (blocks secrets, raw logs, prompt injection)
-* Runs inside your cluster. No Skyflo telemetry or phone-home
-* LLM-agnostic via LiteLLM. No vendor lock-in
-
----
-
-### Supported Tools
-
-| Tool              | Capabilities                                                                     |
-| ----------------- | -------------------------------------------------------------------------------- |
-| **Kubernetes**    | discovery, get/describe, logs/exec, diff-first apply, rollout history, rollbacks |
-| **Helm**          | template, install/upgrade/rollback, dry-run, diff-first safety                   |
-| **Argo Rollouts** | status, pause/resume, promote/cancel, progressive delivery control               |
-| **Jenkins**       | jobs/builds/logs, parameters, SCM context, build control                         |
-
-All mutating tool calls require explicit approval.
-
----
-
-### Demo
-
-<p align="center">
-  <img src="assets/demo.gif" alt="Skyflo Demo" width="100%"/>
-</p>
-
-Deterministic plans. Explicit approval. Verified execution.
-
----
-
-### Comparison
-
-| Capability                    | CLI Assistants | Autonomous Agents | GitOps Platforms | **Skyflo** |
-| ----------------------------- | -------------: | ----------------: | ---------------: | ---------: |
-| Natural language ops          |            Yes |               Yes |          Limited |        Yes |
-| Mandatory mutation approval   |       Optional |                No |         PR-based |        Yes |
-| Deterministic control loop    |             No |                No |          Partial |        Yes |
-| Kubernetes + CI unified       |             No |           Partial |               No |        Yes |
-| In-cluster deployment         |        Partial |           Partial |           Varies |        Yes |
-| Team RBAC + audit             |             No |           Limited |              Yes |        Yes |
-| Real-time execution streaming |             No |                No |               No |        Yes |
-
----
-
-### System Architecture
-
-| Component                | Description                                                                                    |
-| ------------------------ | ---------------------------------------------------------------------------------------------- |
-| [**Engine**](engine)     | LangGraph workflow: memory retrieval, planner, approval gate, verifier, persistence, auth/RBAC |
-| [**MCP Server**](mcp)    | Typed tools for Kubernetes, Helm, Argo Rollouts, Jenkins                                       |
-| [**Command Center**](ui) | Next.js UI with real-time streaming, approvals, memory context panel, team admin               |
-
-Details: [Architecture](https://skyflo.ai/docs/architecture)
-
----
-
-### Contributing
-
-Apache 2.0 OSS. High-signal contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-### License
-
-Apache 2.0. See [LICENSE](LICENSE).
-
----
-
-### Community
-
-<p>
-  <a href="https://skyflo.ai/docs">Docs</a> ·
-  <a href="https://discord.gg/kCFNavMund">Discord</a> ·
-  <a href="https://x.com/skyflo_ai">X</a> ·
-  <a href="https://www.linkedin.com/company/skyflo">LinkedIn</a>
-</p>
+本项目基于 [Skyflo](https://github.com/skyflo-ai/skyflo) 开发，保留原项目版权与 Apache License 2.0 许可信息。

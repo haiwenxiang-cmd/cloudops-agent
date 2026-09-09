@@ -10,7 +10,8 @@ export interface ToolExecution {
     | "pending"
     | "awaiting_approval"
     | "denied"
-    | "approved";
+    | "approved"
+    | "cancelled";
   result?: Array<{
     type: string;
     text?: string;
@@ -19,6 +20,13 @@ export interface ToolExecution {
   timestamp: number;
   error?: string;
   requires_approval?: boolean;
+  requires_verification?: boolean;
+  operation_id?: string;
+  execution_status?: string;
+  verification_status?: string;
+  verification_reason?: string;
+  partial_commit_detected?: boolean;
+  run_id?: string;
 }
 
 export type MessageSegment =

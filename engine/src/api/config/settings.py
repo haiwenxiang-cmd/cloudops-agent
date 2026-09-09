@@ -1,6 +1,6 @@
 from typing import Literal, Optional
 
-from pydantic import Field, conint
+from pydantic import Field, confloat, conint
 from pydantic_settings import BaseSettings
 
 
@@ -31,6 +31,19 @@ class Settings(BaseSettings):
     MCP_SERVER_URL: str = "http://127.0.0.1:8888/mcp"
 
     INTERNAL_API_KEY: str = ""
+
+    SKYFLO_ENVIRONMENT: str = "development"
+    MUTATION_CONTROL_ENABLED: bool = True
+    MUTATION_ALLOWED_NAMESPACES: str = "default,skyflo"
+    MUTATION_LEASE_SECONDS: conint(ge=5) = 180
+    MUTATION_VERIFICATION_LEASE_SECONDS: conint(ge=5) = 120
+    MUTATION_VERIFICATION_TIMEOUT_SECONDS: conint(ge=1) = 90
+    MUTATION_VERIFICATION_INTERVAL_SECONDS: confloat(gt=0) = 2.0
+    MUTATION_RECOVERY_INTERVAL_SECONDS: conint(ge=1) = 30
+    MUTATION_RECOVERY_GRACE_SECONDS: conint(ge=0) = 15
+    MUTATION_RECOVERY_BATCH_SIZE: conint(ge=1, le=500) = 20
+    MUTATION_MAX_VERIFICATION_ATTEMPTS: conint(ge=1, le=100) = 5
+    MUTATION_MAX_VERIFICATION_AGE_SECONDS: conint(ge=60) = 3600
 
     INTEGRATIONS_SECRET_NAMESPACE: Optional[str] = Field(default="default")
 

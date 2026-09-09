@@ -14,4 +14,11 @@ data:
   RETRY_BASE_DELAY: {{ .Values.mcp.config.retryBaseDelay | quote }}
   RETRY_MAX_DELAY: {{ .Values.mcp.config.retryMaxDelay | quote }}
   RETRY_EXPONENTIAL_BASE: {{ .Values.mcp.config.retryExponentialBase | quote }}
+  COMMAND_READ_TIMEOUT_SECONDS: {{ .Values.mcp.config.commandReadTimeoutSeconds | quote }}
+  COMMAND_MUTATION_TIMEOUT_SECONDS: {{ .Values.mcp.config.commandMutationTimeoutSeconds | quote }}
+  COMMAND_TERMINATE_GRACE_SECONDS: {{ .Values.mcp.config.commandTerminateGraceSeconds | quote }}
+  COMMAND_MAX_RETRY_ATTEMPTS: {{ .Values.mcp.config.commandMaxRetryAttempts | quote }}
+  COMMAND_RETRY_BASE_DELAY_SECONDS: {{ .Values.mcp.config.commandRetryBaseDelaySeconds | quote }}
+  COMMAND_RETRY_MAX_DELAY_SECONDS: {{ .Values.mcp.config.commandRetryMaxDelaySeconds | quote }}
+  COMMAND_RETRY_EXPONENTIAL_BASE: {{ .Values.mcp.config.commandRetryExponentialBase | quote }}
   ENGINE_INTERNAL_URL: {{ include "skyflo.engine.internalUrl" . | quote }}

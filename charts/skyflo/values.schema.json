@@ -20,6 +20,30 @@
           }
         }
       }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "rbac": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["clusterAdmin", "mutationNamespaces", "readNamespaces"],
+          "properties": {
+            "clusterAdmin": { "type": "boolean" },
+            "mutationNamespaces": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            },
+            "readNamespaces": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
     }
   }
 }

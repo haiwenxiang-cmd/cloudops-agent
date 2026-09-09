@@ -10,10 +10,20 @@ from utils.commands import run_command
 from utils.models import ToolOutput
 
 
-async def run_argo_command(command: str) -> ToolOutput:
+async def run_argo_command(
+    command: str,
+    *,
+    fallback: Optional[tuple[str, list[str]]] = None,
+) -> ToolOutput:
     """Run an argo rollouts command and return its output."""
     cmd_parts = [part for part in command.split(" ") if part]
-    return await run_command("kubectl", ["argo", "rollouts"] + cmd_parts)
+    if fallback is None:
+        return await run_command("kubectl", ["argo", "rollouts"] + cmd_parts)
+    return await run_command(
+        "kubectl",
+        ["argo", "rollouts"] + cmd_parts,
+        fallback=fallback,
+    )
 
 
 @mcp.tool(title="List Argo Rollouts", tags=["argo"], annotations={"readOnlyHint": True})
@@ -140,7 +150,13 @@ async def argo_status(
         cmd += f" -n {namespace}"
     if watch:
         cmd += " --watch"
-    return await run_argo_command(cmd)
+    fallback_args = ["get", "rollouts.argoproj.io", name, "-o", "yaml"]
+    if namespace:
+        fallback_args.extend(["-n", namespace])
+    return await run_argo_command(
+        cmd,
+        fallback=None if watch else ("kubectl", fallback_args),
+    )
 
 
 @mcp.tool(title="Get Argo Rollout History", tags=["argo"], annotations={"readOnlyHint": True})

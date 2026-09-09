@@ -17,6 +17,13 @@ from .memory import (
     MemoryStore,
     MemoryVersion,
 )
+from .mutation import (
+    ApprovalStatus,
+    ExecutionStatus,
+    MutationOperation,
+    PolicyDecision,
+    VerificationStatus,
+)
 from .refresh_token import RefreshToken
 from .user import User, UserCreate, UserDB, UserRead, UserUpdate
 
@@ -33,6 +40,11 @@ __all__ = [
     "ConversationMemoryUsage",
     "DreamJob",
     "DreamReviewItem",
+    "MutationOperation",
+    "ExecutionStatus",
+    "VerificationStatus",
+    "PolicyDecision",
+    "ApprovalStatus",
     "UserCreate",
     "UserRead",
     "UserUpdate",

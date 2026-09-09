@@ -16,6 +16,8 @@ class AgentState(BaseModel):
     done: bool = False
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
+    user_role: Optional[str] = None
+    environment: str = "development"
     error: Optional[str] = None
     retry_count: int = 0
     max_retries: int = 3
@@ -23,6 +25,11 @@ class AgentState(BaseModel):
     suppress_pending_event: bool = False
     ttft_emitted: bool = False
     approval_decisions: Dict[str, bool] = Field(default_factory=dict)
+    approval_reasons: Dict[str, str] = Field(default_factory=dict)
+    mutation_operations: List[Dict[str, Any]] = Field(default_factory=list)
+    verification_required: bool = False
+    verification_blocked: bool = False
+    verification_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     loaded_toolsets: Dict[str, bool] = Field(
         default_factory=lambda: {"k8s": False, "memory": False}
     )

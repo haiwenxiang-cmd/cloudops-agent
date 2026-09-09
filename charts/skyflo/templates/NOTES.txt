@@ -1,5 +1,12 @@
 Skyflo {{ .Chart.AppVersion }} has been installed in namespace {{ .Release.Namespace }}.
 
+{{ if .Values.mcp.rbac.clusterAdmin }}
+WARNING: mcp.rbac.clusterAdmin=true grants the MCP ServiceAccount unrestricted cluster access.
+Use this only as a temporary compatibility escape hatch, never as the production default.
+{{ else }}
+MCP least-privilege RBAC is enabled. Mutation namespaces: {{ join ", " .Values.mcp.rbac.mutationNamespaces }}.
+{{ end }}
+
 Check rollout status:
 
   kubectl get pods -n {{ .Release.Namespace }}

@@ -179,7 +179,11 @@ export function ChatMessages({
                 )}
               >
                 {message.type === "user" ? (
-                  <div className={cn("prose prose-invert max-w-none")}>
+                  <div
+                    className={cn("prose prose-invert max-w-none")}
+                    translate="no"
+                    data-original-text="true"
+                  >
                     {message.content}
                   </div>
                 ) : (

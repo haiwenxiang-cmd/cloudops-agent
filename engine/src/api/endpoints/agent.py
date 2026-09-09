@@ -8,6 +8,7 @@ import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from tortoise.exceptions import DoesNotExist
 
 from ..agent.graph import build_graph
 from ..config import rate_limit_dependency, settings
@@ -16,6 +17,8 @@ from ..models.conversation import Conversation
 from ..services.approvals import ApprovalService
 from ..services.auth import fastapi_users
 from ..services.conversation_persistence import ConversationPersistenceService
+from ..services.mcp_client import MCPClient
+from ..services.mutation_journal import MutationJournalService
 from ..services.stop_service import clear_stop, request_stop
 from ..services.title_generator import generate_and_store_title
 from ..services.tool_executor import ToolExecutor
@@ -32,6 +35,40 @@ _redis_lock = asyncio.Lock()
 
 _tools_cache = ToolsCache()
 
+_workflow_tasks: Dict[str, asyncio.Task] = {}
+_workflow_tasks_lock = asyncio.Lock()
+
+SSE_EVENT_BUFFER_LIMIT = 1000
+SSE_EVENT_TTL_SECONDS = 900
+
+
+async def register_workflow_task(run_id: str, task: asyncio.Task) -> None:
+    async with _workflow_tasks_lock:
+        _workflow_tasks[run_id] = task
+
+
+async def unregister_workflow_task(run_id: str, task: asyncio.Task) -> None:
+    async with _workflow_tasks_lock:
+        if _workflow_tasks.get(run_id) is task:
+            _workflow_tasks.pop(run_id, None)
+
+
+async def cancel_workflow_task(run_id: str) -> Dict[str, bool]:
+    async with _workflow_tasks_lock:
+        task = _workflow_tasks.get(run_id)
+    if task is None or task.done():
+        return {"requested": False, "confirmed": True}
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+    except asyncio.CancelledError:
+        return {"requested": True, "confirmed": True}
+    except asyncio.TimeoutError:
+        return {"requested": True, "confirmed": False}
+    except Exception:
+        return {"requested": True, "confirmed": task.done()}
+    return {"requested": True, "confirmed": task.done()}
+
 
 async def get_redis_client():
     global redis_client
@@ -44,8 +81,75 @@ async def get_redis_client():
     return redis_client
 
 
-def sse_format(event: str, data: Dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def sse_format(event: str, data: Dict[str, Any], event_id: Optional[int] = None) -> str:
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{id_line}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _events_key(channel: str) -> str:
+    return f"{channel}:events"
+
+
+def _sequence_key(channel: str) -> str:
+    return f"{channel}:sequence"
+
+
+def _run_conversation_key(run_id: str) -> str:
+    return f"run:conversation:{run_id}"
+
+
+def _is_terminal_payload(payload: Dict[str, Any]) -> bool:
+    return payload.get("status") in {
+        "completed",
+        "error",
+        "awaiting_approval",
+        "stopped",
+        "stop_partial",
+        "recovered",
+    }
+
+
+def _decode_buffered_event(raw: str) -> Optional[Dict[str, Any]]:
+    try:
+        event = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(event, dict) or not isinstance(event.get("id"), int):
+        return None
+    return event
+
+
+def _decode_published_event(raw: str) -> Optional[Dict[str, Any]]:
+    event_id: Optional[int] = None
+    event_name = "message"
+    data: Optional[Dict[str, Any]] = None
+    for line in raw.splitlines():
+        if line.startswith("id: "):
+            try:
+                event_id = int(line[4:].strip())
+            except ValueError:
+                return None
+        elif line.startswith("event: "):
+            event_name = line[7:].strip()
+        elif line.startswith("data: "):
+            try:
+                parsed = json.loads(line[6:])
+            except json.JSONDecodeError:
+                return None
+            if isinstance(parsed, dict):
+                data = parsed
+    if event_id is None or data is None:
+        return None
+    return {"id": event_id, "event": event_name, "data": data}
+
+
+def _has_event_history_gap(
+    *, last_event_id: int, oldest_event_id: Optional[int], latest_event_id: int
+) -> bool:
+    return bool(
+        latest_event_id > last_event_id
+        and (oldest_event_id is None or oldest_event_id > last_event_id + 1)
+    )
 
 
 def strip_integration_meta_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -71,9 +175,37 @@ async def publish_event(channel: str, event: str, payload: Dict[str, Any]):
     r = await get_redis_client()
     try:
         sanitized_payload = strip_integration_meta_keys(payload)
-        await r.publish(channel, sse_format(event, sanitized_payload))
+        event_id = int(await r.incr(_sequence_key(channel)))
+        buffered = json.dumps(
+            {"id": event_id, "event": event, "data": sanitized_payload},
+            ensure_ascii=False,
+        )
+        formatted = sse_format(event, sanitized_payload, event_id=event_id)
+        pipeline = r.pipeline(transaction=True)
+        pipeline.rpush(_events_key(channel), buffered)
+        pipeline.ltrim(_events_key(channel), -SSE_EVENT_BUFFER_LIMIT, -1)
+        pipeline.expire(_events_key(channel), SSE_EVENT_TTL_SECONDS)
+        pipeline.expire(_sequence_key(channel), SSE_EVENT_TTL_SECONDS)
+        if channel.startswith("run:"):
+            pipeline.expire(
+                _run_conversation_key(channel.removeprefix("run:")),
+                SSE_EVENT_TTL_SECONDS,
+            )
+        pipeline.publish(channel, formatted)
+        await pipeline.execute()
     except Exception as e:
         logger.error(f"Error publishing to Redis channel {channel}: {str(e)}")
+
+
+async def remember_run_conversation(run_id: str, conversation_id: Optional[str]) -> None:
+    if not conversation_id:
+        return
+    r = await get_redis_client()
+    await r.set(
+        _run_conversation_key(run_id),
+        str(conversation_id),
+        ex=SSE_EVENT_TTL_SECONDS,
+    )
 
 
 async def create_sse_event_generator(
@@ -83,8 +215,10 @@ async def create_sse_event_generator(
     workflow_kwargs: Dict[str, Any],
     endpoint_name: str,
     on_subscribed: Optional[Callable[[], Awaitable[None]]] = None,
+    start_workflow: bool = True,
+    last_event_id: int = 0,
 ) -> AsyncGenerator[bytes, None]:
-    """Create a reusable SSE event generator for workflow execution."""
+    """Stream a workflow, replaying buffered events after transient disconnects."""
     r = await get_redis_client()
     pubsub = r.pubsub()
     workflow_task: Optional[asyncio.Task] = None
@@ -93,7 +227,7 @@ async def create_sse_event_generator(
         # Subscribe only to the unique run_id channel
         await pubsub.subscribe(channel)
 
-        if on_subscribed:
+        if start_workflow and on_subscribed:
             try:
                 await on_subscribed()
             except Exception as e:
@@ -102,78 +236,112 @@ async def create_sse_event_generator(
                     exc_info=True,
                 )
 
-        workflow_task = asyncio.create_task(run_agent_workflow(**workflow_kwargs))
+        buffered_events = await r.lrange(_events_key(channel), 0, -1)
+        decoded_buffer = [
+            decoded
+            for raw_event in buffered_events
+            if (decoded := _decode_buffered_event(raw_event)) is not None
+        ]
+        last_sent_event_id = max(0, last_event_id)
+        oldest_event_id = decoded_buffer[0]["id"] if decoded_buffer else None
+        latest_sequence_raw = await r.get(_sequence_key(channel))
+        try:
+            latest_sequence = int(latest_sequence_raw or 0)
+        except (TypeError, ValueError):
+            latest_sequence = 0
+        history_gap = _has_event_history_gap(
+            last_event_id=last_sent_event_id,
+            oldest_event_id=oldest_event_id,
+            latest_event_id=latest_sequence,
+        )
+        if history_gap:
+            gap_payload = {
+                "type": "stream.gap",
+                "status": "error",
+                "run_id": run_id,
+                "expected_event_id": last_sent_event_id + 1,
+                "oldest_available_event_id": oldest_event_id,
+                "latest_event_id": latest_sequence,
+                "recovery": "reload_conversation",
+                "error": "The resumable event history is incomplete.",
+            }
+            yield sse_format("stream.gap", gap_payload).encode()
+            return
 
-        yield sse_format("ready", {"run_id": run_id}).encode()
+        replayed_any = False
+        last_replayed_was_terminal = False
+        for decoded in decoded_buffer:
+            if decoded["id"] <= last_sent_event_id:
+                continue
+            replayed_any = True
+            last_sent_event_id = decoded["id"]
+            yield sse_format(
+                decoded["event"],
+                decoded["data"],
+                event_id=decoded["id"],
+            ).encode()
+            # Do not stop on an older terminal if recovery events were appended
+            # later.  Replay the complete ordered suffix, then decide from the
+            # newest event.
+            last_replayed_was_terminal = _is_terminal_payload(decoded["data"])
+
+        if last_replayed_was_terminal:
+            return
+        if (
+            not replayed_any
+            and decoded_buffer
+            and _is_terminal_payload(decoded_buffer[-1]["data"])
+        ):
+            # A fresh client can present an already-consumed Last-Event-ID. Send
+            # the terminal once more so it does not reconnect forever on EOF.
+            terminal = decoded_buffer[-1]
+            yield sse_format(
+                terminal["event"], terminal["data"], event_id=terminal["id"]
+            ).encode()
+            return
+
+        if start_workflow:
+
+            async def workflow_runner() -> None:
+                current_task = asyncio.current_task()
+                try:
+                    await run_agent_workflow(**workflow_kwargs)
+                finally:
+                    if current_task is not None:
+                        await unregister_workflow_task(run_id, current_task)
+
+            workflow_task = asyncio.create_task(workflow_runner())
+            await register_workflow_task(run_id, workflow_task)
+
+        yield sse_format(
+            "ready",
+            {"run_id": run_id, "resumed": not start_workflow},
+            event_id=last_sent_event_id,
+        ).encode()
 
         while True:
             if await request.is_disconnected():
-                workflow_task.cancel()
-                try:
-                    await workflow_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(
-                        f"Error while cancelling workflow task for run {run_id}: {str(e)}",
-                        exc_info=True,
-                    )
                 break
 
-            if workflow_task.done():
-                try:
-                    exc = workflow_task.exception()
-                    if exc:
-                        logger.error(
-                            f"Workflow task for run {run_id} failed with exception: {exc}",
-                            exc_info=exc,
-                        )
-                        error_data = {
-                            "run_id": run_id,
-                            "error": str(exc),
-                            "status": "error",
-                        }
-                        yield sse_format("error", error_data).encode()
-                except asyncio.CancelledError:
-                    pass
-                break
-
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=60.0)
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15.0)
 
             if message is None:
                 yield sse_format("heartbeat", {"timestamp": now_ms()}).encode()
                 continue
 
             if message["type"] == "message":
+                decoded = _decode_published_event(message["data"])
+                if decoded is None or decoded["id"] <= last_sent_event_id:
+                    continue
+                last_sent_event_id = decoded["id"]
                 yield (message["data"] + "\n").encode()
-
-                try:
-                    data = json.loads(message["data"].split("\ndata: ")[1].split("\n\n")[0])
-                    if data.get("status") in [
-                        "completed",
-                        "error",
-                        "awaiting_approval",
-                        "stopped",
-                    ]:
-                        break
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    pass
+                if _is_terminal_payload(decoded["data"]):
+                    break
 
     except Exception as e:
         logger.error(f"Error in {endpoint_name} SSE stream for run {run_id}: {str(e)}")
         yield sse_format("error", {"error": str(e)}).encode()
     finally:
-        if workflow_task and not workflow_task.done():
-            workflow_task.cancel()
-            try:
-                await workflow_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(
-                    f"Error while cancelling workflow task for run {run_id}: {str(e)}",
-                    exc_info=True,
-                )
         await pubsub.unsubscribe(channel)
         await pubsub.close()
 
@@ -270,6 +438,7 @@ def create_event_callback(
                         "tool": event.get("tool"),
                         "title": event.get("title"),
                         "args": event.get("args", {}),
+                        "run_id": event_run_id,
                         "status": (
                             "executing" if event_type == "tool.executing" else "awaiting_approval"
                         ),
@@ -289,6 +458,7 @@ def create_event_callback(
                                 "tool": tool.get("tool"),
                                 "title": tool.get("title"),
                                 "args": tool.get("args", {}),
+                                "run_id": event_run_id,
                                 "requires_approval": bool(tool.get("requires_approval", False)),
                                 "status": "pending",
                                 "timestamp": int(tool.get("timestamp", event.get("timestamp"))),
@@ -301,16 +471,26 @@ def create_event_callback(
                             f"Failed to append tool segment for call_id {tool.get('call_id')}: {e}"
                         )
                         continue
-            elif event_type in ("tool.approved", "tool.denied", "tool.error"):
+            elif event_type in (
+                "tool.approved",
+                "tool.denied",
+                "tool.error",
+                "tool.cancelled",
+            ):
                 status_map = {
                     "tool.approved": "approved",
                     "tool.denied": "denied",
                     "tool.error": "error",
+                    "tool.cancelled": "cancelled",
                 }
 
                 result_blocks = None
                 if event_type == "tool.denied":
                     result_blocks = [{"type": "text", "text": "Tool call was denied by the user"}]
+                elif event_type == "tool.cancelled":
+                    result_blocks = [
+                        {"type": "text", "text": event.get("error") or "Cancelled by user"}
+                    ]
 
                 await persistence.update_tool_segment_status(
                     conversation_id=conversation_id,
@@ -326,7 +506,7 @@ def create_event_callback(
                     status="completed",
                     result=event.get("result"),
                 )
-            elif event_type == "completed":
+            elif event_type in ("completed", "workflow_complete"):
                 duration_ms = event.get("duration_ms")
                 if duration_ms is None:
                     duration = event.get("duration")
@@ -364,9 +544,11 @@ async def run_agent_workflow(
     persistence: Optional[ConversationPersistenceService] = None,
     conversation: Optional[Conversation] = None,
     user_id: Optional[str] = None,
+    user_role: Optional[str] = None,
     pending_tools: Optional[list[Dict[str, Any]]] = None,
     suppress_pending_event: bool = False,
     approval_decisions: Optional[Dict[str, bool]] = None,
+    approval_reasons: Optional[Dict[str, str]] = None,
 ):
     """Unified function to run agent workflow with optional pending tools."""
     try:
@@ -396,8 +578,11 @@ async def run_agent_workflow(
             }
 
             resolved_user_id = resolve_workflow_user_id(conversation, user_id)
-            if resolved_user_id:
-                initial_state["user_id"] = resolved_user_id
+            # Explicitly overwrite checkpoint identity fields, including None, so
+            # a role removed between turns cannot survive in durable state.
+            initial_state["user_id"] = resolved_user_id
+            initial_state["user_role"] = user_role
+            initial_state["environment"] = settings.SKYFLO_ENVIRONMENT
 
             if suppress_pending_event:
                 initial_state["suppress_pending_event"] = True
@@ -407,6 +592,8 @@ async def run_agent_workflow(
 
             if approval_decisions is not None:
                 initial_state["approval_decisions"] = approval_decisions
+            if approval_reasons is not None:
+                initial_state["approval_reasons"] = approval_reasons
 
             result = await workflow_graph.invoke(initial_state)
             status = "completed"
@@ -415,10 +602,24 @@ async def run_agent_workflow(
                     status = "awaiting_approval"
                 elif result.get("stopped"):
                     status = "stopped"
-            await publish_event(
-                channel,
-                "workflow_complete",
-                {"run_id": run_id, "result": result, "status": status},
+                elif result.get("error"):
+                    status = "error"
+            duration = result.get("duration") if isinstance(result, dict) else None
+            await event_callback(
+                {
+                    "type": "workflow_complete",
+                    "run_id": run_id,
+                    "result": result,
+                    "status": status,
+                    **(
+                        {
+                            "duration": duration,
+                            "duration_ms": int(duration * 1000),
+                        }
+                        if isinstance(duration, (int, float))
+                        else {}
+                    ),
+                }
             )
 
         finally:
@@ -433,6 +634,15 @@ async def run_agent_workflow(
                 "type": "workflow.error",
                 "run_id": run_id,
                 "error": str(e),
+            },
+        )
+        await publish_event(
+            channel,
+            "workflow_complete",
+            {
+                "type": "workflow_complete",
+                "run_id": run_id,
+                "result": {"done": True, "error": str(e)},
                 "status": "error",
             },
         )
@@ -465,8 +675,12 @@ async def chat_stream(request: Request, user=Depends(fastapi_users.current_user(
         channel = f"run:{unique_run_id}"
 
         workflow_user_id: Optional[str] = None
+        workflow_user_role: Optional[str] = None
         if user and getattr(user, "id", None):
             workflow_user_id = str(user.id)
+            workflow_user_role = (
+                "superuser" if getattr(user, "is_superuser", False) else getattr(user, "role", None)
+            )
 
         conversation: Optional[Conversation] = None
         persistence: Optional[ConversationPersistenceService] = None
@@ -474,29 +688,35 @@ async def chat_stream(request: Request, user=Depends(fastapi_users.current_user(
         if conversation_id:
             try:
                 conversation = await Conversation.get(id=conversation_id)
-            except Exception:
-                conversation = None
+            except DoesNotExist as e:
+                raise HTTPException(status_code=404, detail="Conversation not found") from e
+            except Exception as e:
+                logger.exception("Failed to load conversation %s", conversation_id)
+                raise HTTPException(
+                    status_code=503, detail="Conversation authorization unavailable"
+                ) from e
 
-            if conversation:
-                check_conversation_authorization(conversation, user)
-                persistence = ConversationPersistenceService()
+            check_conversation_authorization(conversation, user)
+            persistence = ConversationPersistenceService()
 
-                try:
-                    latest_user = None
-                    for msg in reversed(messages):
-                        if isinstance(msg, dict) and msg.get("role") == "user":
-                            latest_user = msg
-                            break
-                    if latest_user:
-                        await persistence.append_user_message(
-                            conversation_id=str(conversation.id),
-                            content=str(latest_user.get("content", "")),
-                            timestamp=now_ms(),
-                        )
-                except Exception as e:
-                    logger.error(f"Error appending initial user message: {e}")
+            try:
+                latest_user = None
+                for msg in reversed(messages):
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        latest_user = msg
+                        break
+                if latest_user:
+                    await persistence.append_user_message(
+                        conversation_id=str(conversation.id),
+                        content=str(latest_user.get("content", "")),
+                        timestamp=now_ms(),
+                    )
+            except Exception as e:
+                logger.error(f"Error appending initial user message: {e}")
 
-                should_generate_title = not conversation.title
+            should_generate_title = not conversation.title
+
+        await remember_run_conversation(unique_run_id, conversation_id)
 
         async def on_stream_subscribed() -> None:
             if not (should_generate_title and conversation and persistence):
@@ -538,6 +758,7 @@ async def chat_stream(request: Request, user=Depends(fastapi_users.current_user(
                     "persistence": persistence,
                     "conversation": conversation,
                     "user_id": workflow_user_id,
+                    "user_role": workflow_user_role,
                 },
                 endpoint_name="chat",
                 on_subscribed=on_stream_subscribed,
@@ -561,7 +782,7 @@ class ApprovalDecision(BaseModel):
     approve: bool = Field(..., description="Whether to approve the tool call")
     reason: Optional[str] = Field(None, description="Optional reason for the decision")
     conversation_id: Optional[str] = Field(
-        None, description="Conversation to resume (same as run_id)"
+        None, description="Conversation whose durable checkpoint should resume"
     )
 
 
@@ -594,11 +815,19 @@ async def decide_approval(
         persistence: Optional[ConversationPersistenceService] = None
         try:
             conversation = await Conversation.get(id=conversation_id)
-            if conversation:
-                check_conversation_authorization(conversation, user)
-                persistence = ConversationPersistenceService()
+            check_conversation_authorization(conversation, user)
+            persistence = ConversationPersistenceService()
+        except DoesNotExist as e:
+            raise HTTPException(status_code=404, detail="Conversation not found") from e
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to fetch conversation {conversation_id} for approval: {e}")
+            logger.exception("Failed to authorize approval conversation %s", conversation_id)
+            raise HTTPException(
+                status_code=503, detail="Conversation authorization unavailable"
+            ) from e
+
+        await remember_run_conversation(unique_run_id, conversation_id)
 
         if not decision.approve:
             if persistence and conversation:
@@ -625,9 +854,19 @@ async def decide_approval(
                     "persistence": persistence,
                     "conversation": conversation,
                     "user_id": (str(user.id) if user and getattr(user, "id", None) else None),
+                    "user_role": (
+                        "superuser"
+                        if user and getattr(user, "is_superuser", False)
+                        else getattr(user, "role", None)
+                        if user
+                        else None
+                    ),
                     "pending_tools": None,
                     "suppress_pending_event": True,
                     "approval_decisions": {call_id: bool(decision.approve)},
+                    "approval_reasons": (
+                        {call_id: decision.reason} if decision.reason is not None else {}
+                    ),
                 },
                 endpoint_name="approval",
             ):
@@ -644,6 +883,72 @@ async def decide_approval(
     except Exception as e:
         logger.exception(f"Error processing approval decision: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing approval: {str(e)}") from e
+
+
+class ResumeStreamRequest(BaseModel):
+    conversation_id: str = Field(..., description="Conversation that owns the run")
+    last_event_id: int = Field(default=0, ge=0)
+
+
+@router.post("/runs/{run_id}/events", dependencies=[rate_limit_dependency])
+async def resume_run_events(
+    run_id: str,
+    request: Request,
+    user=Depends(fastapi_users.current_user(optional=True)),
+):
+    try:
+        normalized_run_id = str(uuid.UUID(run_id))
+    except (ValueError, TypeError, AttributeError) as e:
+        raise HTTPException(status_code=400, detail="Invalid run_id") from e
+
+    body = await request.json()
+    resume = ResumeStreamRequest(**body)
+    try:
+        conversation = await Conversation.get(id=resume.conversation_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="Conversation not found") from e
+    check_conversation_authorization(conversation, user)
+
+    r = await get_redis_client()
+    expected_conversation = await r.get(_run_conversation_key(normalized_run_id))
+    if expected_conversation != resume.conversation_id:
+        async def expired_mapping_generator() -> AsyncGenerator[bytes, None]:
+            payload = {
+                "type": "stream.gap",
+                "status": "error",
+                "run_id": normalized_run_id,
+                "conversation_id": resume.conversation_id,
+                "recovery": "reload_conversation",
+                "reason": "run_mapping_expired",
+                "error": "The resumable run mapping expired.",
+            }
+            yield sse_format("stream.gap", payload).encode()
+
+        return StreamingResponse(
+            expired_mapping_generator(),
+            media_type="text/event-stream",
+            headers=get_sse_response_headers(),
+        )
+
+    channel = f"run:{normalized_run_id}"
+
+    async def event_generator() -> AsyncGenerator[bytes, None]:
+        async for event in create_sse_event_generator(
+            request=request,
+            channel=channel,
+            run_id=normalized_run_id,
+            workflow_kwargs={},
+            endpoint_name="resume",
+            start_workflow=False,
+            last_event_id=resume.last_event_id,
+        ):
+            yield event
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=get_sse_response_headers(),
+    )
 
 
 class StopRequest(BaseModel):
@@ -665,20 +970,78 @@ async def stop_run(request: Request, user=Depends(fastapi_users.current_user(opt
 
         if conversation:
             check_conversation_authorization(conversation, user)
+        else:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
-        await request_stop(req.run_id)
+        stop_flag_set = await request_stop(req.run_id)
+
+        workflow_cancel = await cancel_workflow_task(req.run_id)
+        persistence = ConversationPersistenceService()
+        cancelled_tools = await persistence.cancel_active_tool_segments(
+            req.conversation_id,
+            req.run_id,
+        )
 
         run_channel = f"run:{req.run_id}"
+        for tool in cancelled_tools:
+            await publish_event(
+                run_channel,
+                "tool.cancelled",
+                {
+                    "type": "tool.cancelled",
+                    "run_id": req.run_id,
+                    "call_id": tool.get("call_id"),
+                    "tool": tool.get("tool"),
+                    "title": tool.get("title"),
+                    "args": tool.get("args", {}),
+                    "error": tool.get("error") or "Cancelled by user",
+                    "timestamp": now_ms(),
+                },
+            )
+
+        mcp_cancel = await MCPClient().cancel_run(req.run_id)
+
+        try:
+            journal_result: Dict[str, Any] = (
+                await MutationJournalService().converge_stopped_run(req.run_id)
+            )
+        except Exception as journal_error:
+            logger.exception("Failed to converge mutation journal for stopped run %s", req.run_id)
+            journal_result = {"error": type(journal_error).__name__}
+
+        partial_reasons: List[str] = []
+        if not stop_flag_set:
+            partial_reasons.append("stop_flag_unavailable")
+        if not workflow_cancel.get("confirmed", False):
+            partial_reasons.append("workflow_cancellation_unconfirmed")
+        if mcp_cancel.get("error"):
+            partial_reasons.append(str(mcp_cancel["error"]))
+        if journal_result.get("error"):
+            partial_reasons.append("journal_convergence_failed")
+        terminal_status = "stop_partial" if partial_reasons else "stopped"
+
         await publish_event(
             run_channel,
             "workflow_complete",
-            {"run_id": req.run_id, "result": {"done": True}, "status": "stopped"},
+            {
+                "type": "workflow_complete",
+                "run_id": req.run_id,
+                "result": {"done": not partial_reasons},
+                "status": terminal_status,
+                "partial_reasons": partial_reasons,
+            },
         )
 
         return {
-            "status": "stopped",
+            "status": terminal_status,
             "conversation_id": req.conversation_id,
             "run_id": req.run_id,
+            "workflow_cancel_requested": workflow_cancel["requested"],
+            "workflow_cancelled": workflow_cancel["confirmed"],
+            "cancelled_tool_count": len(cancelled_tools),
+            "mcp_processes": mcp_cancel,
+            "mutation_journal": journal_result,
+            "partial_reasons": partial_reasons,
         }
     except HTTPException:
         raise

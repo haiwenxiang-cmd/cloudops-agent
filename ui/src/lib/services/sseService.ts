@@ -13,6 +13,20 @@ import {
 } from "@/types/events";
 import { ChatMessage, ToolExecution, TokenUsage } from "@/types/chat";
 
+export interface StreamRecoveryNotice {
+  conversationId: string;
+  runId?: string;
+  reason?: string;
+  error?: string;
+}
+
+export interface RunTerminalNotice {
+  status: string;
+  runId?: string;
+  partialReasons: string[];
+  durationMs?: number;
+}
+
 export interface ChatServiceCallbacks {
   onMessage?: (message: ChatMessage) => void;
   onToolExecuting?: (execution: ToolExecution) => void;
@@ -22,6 +36,7 @@ export interface ChatServiceCallbacks {
   onToolApproved?: (execution: ToolExecution) => void;
   onToolDenied?: (execution: ToolExecution) => void;
   onToolError?: (execution: ToolExecution) => void;
+  onToolCancelled?: (execution: ToolExecution) => void;
   onToolProgress?: (
     execution: ToolExecution,
     message?: string,
@@ -33,6 +48,8 @@ export interface ChatServiceCallbacks {
   onTokenUsage?: (usage: TokenUsage, source: "turn_check" | "main") => void;
   onTTFT?: (duration: number, runId: string) => void;
   onError?: (error: string) => void;
+  onRecoveryRequired?: (notice: StreamRecoveryNotice) => void;
+  onRunTerminal?: (notice: RunTerminalNotice) => void;
   onComplete?: (duration_ms?: number) => void;
   onReady?: (runId: string) => void;
   onConversationTitleGenerated?: (
@@ -47,14 +64,70 @@ export interface ChatServiceCallbacks {
 }
 
 export class ChatService {
-  private eventSource: EventSource | null = null;
+  private abortController: AbortController | null = null;
   private callbacks: ChatServiceCallbacks = {};
   private isConnected: boolean = false;
   private toolExecutions = new Map<string, ToolExecution>();
   private hasCompleted: boolean = false;
+  private currentRunId: string | null = null;
+  private currentConversationId: string | null = null;
+  private lastEventId: number = 0;
+  private intentionalDisconnect: boolean = false;
+  private readonly maxReconnectAttempts = 3;
 
   constructor(callbacks: ChatServiceCallbacks = {}) {
     this.callbacks = callbacks;
+  }
+
+  private activeRunStorageKey(conversationId: string): string {
+    return `skyflo:active-run:${conversationId}`;
+  }
+
+  getPersistedRunId(conversationId: string): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = window.sessionStorage.getItem(
+        this.activeRunStorageKey(conversationId),
+      );
+      if (!raw) return null;
+      const saved = JSON.parse(raw) as { runId?: unknown; savedAt?: unknown };
+      const savedAt = Number(saved.savedAt);
+      if (
+        typeof saved.runId !== "string" ||
+        !saved.runId ||
+        !Number.isFinite(savedAt) ||
+        Date.now() - savedAt > 15 * 60 * 1000
+      ) {
+        this.clearPersistedRun(conversationId);
+        return null;
+      }
+      return saved.runId;
+    } catch {
+      this.clearPersistedRun(conversationId);
+      return null;
+    }
+  }
+
+  private persistActiveRun(): void {
+    if (
+      typeof window === "undefined" ||
+      !this.currentRunId ||
+      !this.currentConversationId
+    ) {
+      return;
+    }
+    window.sessionStorage.setItem(
+      this.activeRunStorageKey(this.currentConversationId),
+      JSON.stringify({ runId: this.currentRunId, savedAt: Date.now() }),
+    );
+  }
+
+  clearPersistedRun(conversationId?: string): void {
+    if (typeof window === "undefined") return;
+    const target = conversationId || this.currentConversationId;
+    if (target) {
+      window.sessionStorage.removeItem(this.activeRunStorageKey(target));
+    }
   }
 
   async startStream(
@@ -62,12 +135,20 @@ export class ChatService {
     conversationId: string,
   ): Promise<void> {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL + "/agent/chat";
+    let controller: AbortController | null = null;
 
     try {
       this.toolExecutions.clear();
       this.hasCompleted = false;
 
       this.disconnect();
+      this.clearPersistedRun(conversationId);
+      this.currentRunId = null;
+      this.currentConversationId = conversationId;
+      this.lastEventId = 0;
+      this.intentionalDisconnect = false;
+      controller = new AbortController();
+      this.abortController = controller;
 
       const requestBody: any = {
         conversation_id: conversationId,
@@ -86,6 +167,7 @@ export class ChatService {
           ...(await this.getAuthHeaders()),
         },
         body: JSON.stringify(requestBody),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -99,9 +181,15 @@ export class ChatService {
         throw new Error("No response body available");
       }
 
-      this.parseSSEStream(response.body);
       this.isConnected = true;
+      await this.consumeWithReconnect(
+        response.body,
+        conversationId,
+        controller,
+      );
     } catch (error) {
+      if (this.isAbortError(error)) return;
+
       let errorMessage = "Unknown error";
       if (error instanceof Error) {
         if (error.message.includes("Failed to fetch")) {
@@ -116,6 +204,11 @@ export class ChatService {
       }
 
       this.callbacks.onError?.(errorMessage);
+      this.clearPersistedRun(conversationId);
+    } finally {
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
     }
   }
 
@@ -127,11 +220,19 @@ export class ChatService {
   ): Promise<void> {
     const apiUrl =
       process.env.NEXT_PUBLIC_API_URL + `/agent/approvals/${callId}`;
+    let controller: AbortController | null = null;
 
     try {
       this.hasCompleted = false;
 
       this.disconnect();
+      if (conversationId) this.clearPersistedRun(conversationId);
+      this.currentRunId = null;
+      this.currentConversationId = conversationId || null;
+      this.lastEventId = 0;
+      this.intentionalDisconnect = false;
+      controller = new AbortController();
+      this.abortController = controller;
 
       const requestBody: any = {
         approve,
@@ -148,6 +249,7 @@ export class ChatService {
           ...(await this.getAuthHeaders()),
         },
         body: JSON.stringify(requestBody),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -161,9 +263,15 @@ export class ChatService {
         throw new Error("No response body available from approval endpoint");
       }
 
-      this.parseSSEStream(response.body);
       this.isConnected = true;
+      await this.consumeWithReconnect(
+        response.body,
+        conversationId || "",
+        controller,
+      );
     } catch (error) {
+      if (this.isAbortError(error)) return;
+
       let errorMessage = "Unknown error";
       if (error instanceof Error) {
         if (error.message.includes("Failed to fetch")) {
@@ -178,6 +286,142 @@ export class ChatService {
       }
 
       this.callbacks.onError?.(errorMessage);
+      if (conversationId) this.clearPersistedRun(conversationId);
+    } finally {
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
+    }
+  }
+
+  async resumePersistedStream(conversationId: string): Promise<boolean> {
+    const runId = this.getPersistedRunId(conversationId);
+    if (!runId) return false;
+
+    const apiUrl =
+      process.env.NEXT_PUBLIC_API_URL +
+      `/agent/runs/${encodeURIComponent(runId)}/events`;
+    this.disconnect();
+    this.toolExecutions.clear();
+    this.hasCompleted = false;
+    this.currentRunId = runId;
+    this.currentConversationId = conversationId;
+    // A page refresh destroys rendered partial state, so replay from zero.
+    // In-process network reconnects still resume from lastEventId below.
+    this.lastEventId = 0;
+    this.intentionalDisconnect = false;
+    const controller = new AbortController();
+    this.abortController = controller;
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "Cache-Control": "no-cache",
+          ...(await this.getAuthHeaders()),
+        },
+        body: JSON.stringify({ conversation_id: conversationId, last_event_id: 0 }),
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(
+          `SSE refresh resume failed: HTTP ${response.status} ${response.statusText}`,
+        );
+      }
+      this.isConnected = true;
+      await this.consumeWithReconnect(response.body, conversationId, controller);
+      return true;
+    } catch (error) {
+      if (this.isAbortError(error)) return false;
+      this.clearPersistedRun(conversationId);
+      this.callbacks.onError?.(
+        error instanceof Error ? error.message : "Unable to resume active run",
+      );
+      return false;
+    } finally {
+      if (this.abortController === controller) this.abortController = null;
+    }
+  }
+
+  private async consumeWithReconnect(
+    initialBody: ReadableStream<Uint8Array>,
+    conversationId: string,
+    controller: AbortController,
+  ): Promise<void> {
+    let body = initialBody;
+    let reconnectAttempt = 0;
+
+    while (true) {
+      await this.parseSSEStream(body);
+
+      if (
+        this.hasCompleted ||
+        this.intentionalDisconnect ||
+        controller.signal.aborted
+      ) {
+        return;
+      }
+
+      if (!this.currentRunId || !conversationId) {
+        throw new Error("SSE disconnected before a resumable run was established");
+      }
+
+      const resumeUrl =
+        process.env.NEXT_PUBLIC_API_URL +
+        `/agent/runs/${encodeURIComponent(this.currentRunId)}/events`;
+      let resumedBody: ReadableStream<Uint8Array> | null = null;
+      let lastError: unknown = null;
+
+      while (
+        resumedBody === null &&
+        reconnectAttempt < this.maxReconnectAttempts
+      ) {
+        reconnectAttempt += 1;
+        await new Promise((resolve) =>
+          setTimeout(resolve, 500 * 2 ** (reconnectAttempt - 1)),
+        );
+        if (controller.signal.aborted || this.intentionalDisconnect) return;
+
+        try {
+          const response = await fetch(resumeUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              ...(await this.getAuthHeaders()),
+            },
+            body: JSON.stringify({
+              conversation_id: conversationId,
+              last_event_id: this.lastEventId,
+            }),
+            signal: controller.signal,
+          });
+
+          if (!response.ok || !response.body) {
+            throw new Error(
+              `SSE resume failed: HTTP ${response.status} ${response.statusText}`,
+            );
+          }
+          resumedBody = response.body;
+        } catch (error) {
+          if (this.isAbortError(error)) return;
+          lastError = error;
+        }
+      }
+
+      if (resumedBody === null) {
+        const detail = lastError instanceof Error ? `: ${lastError.message}` : "";
+        throw new Error(
+          `SSE reconnect failed after ${this.maxReconnectAttempts} attempts${detail}`,
+        );
+      }
+
+      this.isConnected = true;
+      reconnectAttempt = 0;
+      body = resumedBody;
     }
   }
 
@@ -204,9 +448,7 @@ export class ChatService {
         }
       }
     } catch (error) {
-      this.callbacks.onError?.(
-        error instanceof Error ? error.message : "Stream error",
-      );
+      if (!this.isAbortError(error)) throw error;
     } finally {
       reader.releaseLock();
       this.isConnected = false;
@@ -214,6 +456,14 @@ export class ChatService {
   }
 
   private processSSELine(line: string): void {
+    if (line.startsWith("id: ")) {
+      const parsed = Number.parseInt(line.substring(4).trim(), 10);
+      if (Number.isFinite(parsed)) {
+        this.lastEventId = Math.max(this.lastEventId, parsed);
+      }
+      return;
+    }
+
     if (line.startsWith("event: ")) {
       return;
     }
@@ -226,7 +476,28 @@ export class ChatService {
       try {
         const eventData = JSON.parse(jsonData);
 
-        if (eventData.type) {
+        if (eventData.type === "stream.gap") {
+          this.hasCompleted = true;
+          this.clearPersistedRun();
+          if (this.currentConversationId) {
+            this.callbacks.onRecoveryRequired?.({
+              conversationId: this.currentConversationId,
+              runId:
+                typeof eventData.run_id === "string" ? eventData.run_id : undefined,
+              reason:
+                typeof eventData.reason === "string" ? eventData.reason : undefined,
+              error:
+                typeof eventData.error === "string" ? eventData.error : undefined,
+            });
+          } else {
+            this.callbacks.onError?.(
+              String(
+                eventData.error ||
+                  "The live event history expired. Reload the conversation to restore its persisted state.",
+              ),
+            );
+          }
+        } else if (eventData.type) {
           this.handleSSEEvent(eventData as Event);
         } else if (eventData.status === "error" && eventData.error) {
           this.callbacks.onError?.(String(eventData.error));
@@ -267,6 +538,8 @@ export class ChatService {
   private handleSSEEvent(event: Event): void {
     switch (event.type) {
       case "ready":
+        this.currentRunId = event.run_id;
+        this.persistActiveRun();
         this.callbacks.onReady?.(event.run_id);
         break;
 
@@ -381,6 +654,28 @@ export class ChatService {
         }
         break;
 
+      case "tool.cancelled": {
+        const existingExecution = this.toolExecutions.get(event.call_id);
+        const cancelledTool: ToolExecution = existingExecution
+          ? {
+              ...existingExecution,
+              status: "cancelled",
+              error: event.error || "Cancelled by user",
+            }
+          : {
+              call_id: event.call_id,
+              tool: event.tool,
+              title: event.title,
+              args: event.args || {},
+              status: "cancelled",
+              timestamp: event.timestamp,
+              error: event.error || "Cancelled by user",
+            };
+        this.toolExecutions.set(event.call_id, cancelledTool);
+        this.callbacks.onToolCancelled?.(cancelledTool);
+        break;
+      }
+
       case "tools.pending":
         const pendingList: ToolExecution[] = [];
 
@@ -462,7 +757,14 @@ export class ChatService {
       case "completed":
         if (!this.hasCompleted) {
           this.hasCompleted = true;
+          this.clearPersistedRun();
           const completedEvent = event as CompletedEvent;
+          this.callbacks.onRunTerminal?.({
+            status: completedEvent.status,
+            runId: completedEvent.run_id,
+            partialReasons: completedEvent.partial_reasons ?? [],
+            durationMs: completedEvent.duration_ms,
+          });
           this.callbacks.onComplete?.(completedEvent.duration_ms);
         }
         break;
@@ -470,7 +772,15 @@ export class ChatService {
       case "workflow_complete":
         if (!this.hasCompleted) {
           this.hasCompleted = true;
-          this.callbacks.onComplete?.();
+          this.clearPersistedRun();
+          const completedEvent = event as WorkflowCompleteEvent;
+          this.callbacks.onRunTerminal?.({
+            status: completedEvent.status,
+            runId: completedEvent.run_id,
+            partialReasons: completedEvent.partial_reasons ?? [],
+            durationMs: completedEvent.duration_ms,
+          });
+          this.callbacks.onComplete?.(completedEvent.duration_ms);
         }
         break;
 
@@ -526,10 +836,21 @@ export class ChatService {
     }
   }
 
-  disconnect(): void {
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
+  private isAbortError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      error.name === "AbortError"
+    );
+  }
+
+  disconnect(clearPersisted: boolean = false): void {
+    this.intentionalDisconnect = true;
+    if (clearPersisted) this.clearPersistedRun();
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
     }
     this.isConnected = false;
     this.hasCompleted = false;

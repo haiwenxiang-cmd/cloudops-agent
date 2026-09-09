@@ -95,6 +95,7 @@ subjects:
     name: {{ include "skyflo.controller.fullname" . }}
     namespace: {{ .Release.Namespace }}
 ---
+{{- if .Values.mcp.rbac.clusterAdmin }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -109,3 +110,143 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "skyflo.mcp.fullname" . }}
     namespace: {{ .Release.Namespace }}
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "skyflo.mcp.fullname" . }}-cluster-reader
+  labels:
+    {{- include "skyflo.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes", "nodes/proxy", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments", "csidrivers", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "skyflo.mcp.fullname" . }}-cluster-reader
+  labels:
+    {{- include "skyflo.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "skyflo.mcp.fullname" . }}-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "skyflo.mcp.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- range $namespace := .Values.mcp.rbac.mutationNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "skyflo.mcp.fullname" $ }}-mutator
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "skyflo.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - persistentvolumeclaims
+      - pods
+      - pods/attach
+      - pods/exec
+      - pods/log
+      - pods/portforward
+      - secrets
+      - services
+      - serviceaccounts
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale", "daemonsets", "replicasets", "statefulsets", "statefulsets/scale"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts", "experiments", "analysisruns", "analysistemplates"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["skyflo.ai"]
+    resources: ["skyfloais"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "skyflo.mcp.fullname" $ }}-mutator
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "skyflo.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "skyflo.mcp.fullname" $ }}-mutator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "skyflo.mcp.fullname" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- range $namespace := .Values.mcp.rbac.readNamespaces }}
+{{- if not (has $namespace $.Values.mcp.rbac.mutationNamespaces) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "skyflo.mcp.fullname" $ }}-reader
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "skyflo.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "endpoints", "events", "persistentvolumeclaims", "pods", "pods/log", "services", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps", "autoscaling", "batch", "networking.k8s.io", "policy", "coordination.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["argoproj.io", "skyflo.ai"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "skyflo.mcp.fullname" $ }}-reader
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "skyflo.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "skyflo.mcp.fullname" $ }}-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "skyflo.mcp.fullname" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

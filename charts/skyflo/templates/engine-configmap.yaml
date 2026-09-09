@@ -21,3 +21,13 @@ data:
   MEMORY_CONTEXT_MAX_DOCS: {{ .Values.engine.config.memoryContextMaxDocs | quote }}
   MEMORY_CONTEXT_TOKEN_BUDGET: {{ .Values.engine.config.memoryContextTokenBudget | quote }}
   MEMORY_REQUIRE_SOURCE_REFS: {{ .Values.engine.config.memoryRequireSourceRefs | quote }}
+  SKYFLO_ENVIRONMENT: {{ .Values.engine.config.environment | quote }}
+  MUTATION_CONTROL_ENABLED: {{ .Values.engine.config.mutationControlEnabled | quote }}
+  MUTATION_ALLOWED_NAMESPACES: {{ join "," .Values.mcp.rbac.mutationNamespaces | quote }}
+  MUTATION_LEASE_SECONDS: {{ .Values.engine.config.mutationLeaseSeconds | quote }}
+  MUTATION_VERIFICATION_LEASE_SECONDS: {{ .Values.engine.config.mutationVerificationLeaseSeconds | quote }}
+  MUTATION_VERIFICATION_TIMEOUT_SECONDS: {{ .Values.engine.config.mutationVerificationTimeoutSeconds | quote }}
+  MUTATION_VERIFICATION_INTERVAL_SECONDS: {{ .Values.engine.config.mutationVerificationIntervalSeconds | quote }}
+  MUTATION_RECOVERY_INTERVAL_SECONDS: {{ .Values.engine.config.mutationRecoveryIntervalSeconds | quote }}
+  MUTATION_RECOVERY_GRACE_SECONDS: {{ .Values.engine.config.mutationRecoveryGraceSeconds | quote }}
+  MUTATION_RECOVERY_BATCH_SIZE: {{ .Values.engine.config.mutationRecoveryBatchSize | quote }}

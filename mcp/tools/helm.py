@@ -66,6 +66,7 @@ async def helm_install(
         default=True, description="Create namespace if missing"
     ),
     wait: Optional[bool] = Field(default=True, description="Block until resources are ready"),
+    skyflo_operation_id: Optional[str] = None,
 ) -> ToolOutput:
     """Install Helm chart."""
     cmd = f"install {release_name} {chart}"
@@ -75,6 +76,8 @@ async def helm_install(
         cmd += " --create-namespace"
     if wait:
         cmd += " --wait"
+    if skyflo_operation_id:
+        cmd += f" --description skyflo-operation:{skyflo_operation_id}"
     return await run_helm_command(cmd)
 
 
@@ -92,6 +95,7 @@ async def helm_install_with_values(
         default=True, description="Create namespace if missing"
     ),
     wait: Optional[bool] = Field(default=True, description="Block until resources are ready"),
+    skyflo_operation_id: Optional[str] = None,
 ) -> ToolOutput:
     """Install Helm chart with custom values."""
     try:
@@ -107,6 +111,8 @@ async def helm_install_with_values(
             cmd += " --create-namespace"
         if wait:
             cmd += " --wait"
+        if skyflo_operation_id:
+            cmd += f" --description skyflo-operation:{skyflo_operation_id}"
 
         result = await run_helm_command(cmd)
 
@@ -129,6 +135,7 @@ async def helm_upgrade(
     namespace: Optional[str] = Field(default=None),
     install: Optional[bool] = Field(default=True, description="Install if release does not exist"),
     wait: Optional[bool] = Field(default=True, description="Block until resources are ready"),
+    skyflo_operation_id: Optional[str] = None,
 ) -> ToolOutput:
     """Upgrade Helm release."""
     cmd = f"upgrade {release_name} {chart}"
@@ -138,6 +145,8 @@ async def helm_upgrade(
         cmd += " --install"
     if wait:
         cmd += " --wait"
+    if skyflo_operation_id:
+        cmd += f" --description skyflo-operation:{skyflo_operation_id}"
     return await run_helm_command(cmd)
 
 
@@ -170,6 +179,7 @@ async def helm_rollback(
     revision: int,
     namespace: Optional[str] = Field(default=None),
     wait: Optional[bool] = Field(default=True, description="Block until rollback completes"),
+    skyflo_operation_id: Optional[str] = None,
 ) -> ToolOutput:
     """Rollback Helm release to previous revision."""
     cmd = f"rollback {release_name} {revision}"
@@ -177,6 +187,8 @@ async def helm_rollback(
         cmd += f" -n {namespace}"
     if wait:
         cmd += " --wait"
+    if skyflo_operation_id:
+        cmd += f" --description skyflo-operation:{skyflo_operation_id}"
     return await run_helm_command(cmd)
 
 
